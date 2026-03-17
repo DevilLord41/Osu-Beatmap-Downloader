@@ -2,6 +2,10 @@
 
 A Windows desktop app that replicates osu!direct functionality, allowing you to browse, search, filter, and download osu! beatmaps with ease.
 
+## Download
+
+Grab the latest release from the [Releases page](https://github.com/DevilLord41/Osu-Beatmap-Downloader/releases). Extract the zip and run `OsuBmDownloader.exe` — no installation required.
+
 ## Features
 
 - Browse all downloadable beatmaps from the osu! website with infinite scroll
@@ -27,7 +31,6 @@ A Windows desktop app that replicates osu!direct functionality, allowing you to 
 ## Prerequisites
 
 - **Windows 10/11** (required for WPF and DPAPI)
-- **.NET 8 SDK** - [Download here](https://dotnet.microsoft.com/download/dotnet/8.0)
 - **osu! API v2 credentials** - You'll need a Client ID and Client Secret
 
 ## Getting osu! API Credentials
@@ -38,55 +41,11 @@ A Windows desktop app that replicates osu!direct functionality, allowing you to 
 4. Set the Application Callback URL to: `http://localhost:7270/callback`
 5. Copy your **Client ID** and **Client Secret**
 
-## Building from Source
-
-### 1. Install .NET 8 SDK
-
-Download and install from: https://dotnet.microsoft.com/download/dotnet/8.0
-
-Verify installation:
-```bash
-dotnet --version
-```
-
-### 2. Clone the repository
-
-```bash
-git clone https://github.com/DevilLord41/Osu-Beatmap-Downloader.git
-cd Osu-Beatmap-Downloader
-```
-
-### 3. Restore dependencies
-
-```bash
-dotnet restore
-```
-
-### 4. Build
-
-```bash
-dotnet build
-```
-
-### 5. Run
-
-```bash
-dotnet run --project OsuBmDownloader
-```
-
-### 6. First launch setup
+## First Launch Setup
 
 On first launch, a settings dialog will appear. Enter:
 - Your **osu! installation path** (e.g., `D:\osu!`)
 - Your **Client ID** and **Client Secret** from the osu! API
-
-## Publishing a Release Build
-
-```bash
-dotnet publish -c Release -r win-x64 --self-contained
-```
-
-The output will be in `OsuBmDownloader/bin/Release/net8.0-windows/win-x64/publish/`.
 
 ## Search Filter Syntax
 
@@ -111,6 +70,45 @@ Example: `shuniki star>=5 & star<=10` - Search for "shuniki" with 5-10 star maps
 - osu! API v2 (OAuth2)
 - NAudio + NAudio.Vorbis (audio playback)
 - Windows DPAPI (encrypted storage)
+
+## Building from Source
+
+### 1. Install .NET 8 SDK
+
+Download and install from: https://dotnet.microsoft.com/download/dotnet/8.0
+
+Verify installation:
+```bash
+dotnet --version
+```
+
+### 2. Clone the repository
+
+```bash
+git clone https://github.com/DevilLord41/Osu-Beatmap-Downloader.git
+cd Osu-Beatmap-Downloader
+```
+
+### 3. Restore and build
+
+```bash
+dotnet restore
+dotnet build
+```
+
+### 4. Run
+
+```bash
+dotnet run --project OsuBmDownloader
+```
+
+### Publishing a self-contained release
+
+```bash
+dotnet publish OsuBmDownloader/OsuBmDownloader.csproj -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish
+```
+
+This produces a single `OsuBmDownloader.exe` in the `publish/` folder with all dependencies bundled.
 
 ## License
 
