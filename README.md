@@ -2,6 +2,10 @@
 
 A Windows desktop app that replicates osu!direct functionality, allowing you to browse, search, filter, and download osu! beatmaps with ease.
 
+![screenshot](screenshot.png)
+
+Made by [HardRockMania](https://osu.ppy.sh/u/hardrockmania)
+
 ## Download
 
 Grab the latest release from the [Releases page](https://github.com/DevilLord41/Osu-Beatmap-Downloader/releases). Extract the zip and run `OsuBmDownloader.exe` — no installation required.
