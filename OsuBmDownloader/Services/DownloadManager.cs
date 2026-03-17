@@ -228,7 +228,7 @@ public class DownloadManager
             {
                 UpdateUI(() => item.Status = DownloadStatus.Downloading);
 
-                // Try mirrors in order: catboy.best (fast), nerinyan.moe (fallback)
+                // Try mirrors in order: catboy.best (fast), nerinyan.moe, sayobot (fallbacks)
                 var urls = new List<string>();
 
                 var catboyUrl = $"https://catboy.best/d/{item.BeatmapSetId}";
@@ -238,6 +238,9 @@ public class DownloadManager
                 var nerinyanUrl = $"https://api.nerinyan.moe/d/{item.BeatmapSetId}";
                 if (noVideo) nerinyanUrl += "?noVideo=true";
                 urls.Add(nerinyanUrl);
+
+                var sayobotUrl = $"https://dl.sayobot.cn/beatmaps/download/{(noVideo ? "novideo" : "full")}/{item.BeatmapSetId}";
+                urls.Add(sayobotUrl);
 
                 var downloaded = false;
                 foreach (var url in urls)
