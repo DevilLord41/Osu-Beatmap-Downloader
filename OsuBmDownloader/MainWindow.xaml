@@ -1,0 +1,476 @@
+<Window x:Class="OsuBmDownloader.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:conv="clr-namespace:OsuBmDownloader.Converters"
+        Title="osu! Beatmap Downloader"
+        Width="1100" Height="700"
+        MinWidth="900" MinHeight="500"
+        WindowStartupLocation="CenterScreen"
+        Background="#FF1A1A2E">
+    <Window.Resources>
+        <conv:StatusToColorConverter x:Key="StatusToColor"/>
+        <conv:DownloadStatusToColorConverter x:Key="DownloadStatusToColor"/>
+        <conv:BoolToVisibilityConverter x:Key="BoolToVisibility"/>
+        <conv:InverseBoolToVisibilityConverter x:Key="InverseBoolToVisibility"/>
+        <conv:DownloadStatusToVisibilityConverter x:Key="DownloadStatusToVisibility"/>
+
+        <!-- Dark ComboBox style with custom template -->
+        <Style TargetType="ComboBox">
+            <Setter Property="Background" Value="#FF3D3D5C"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="BorderBrush" Value="#FF555577"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ComboBox">
+                        <Grid>
+                            <ToggleButton x:Name="ToggleButton"
+                                          Background="{TemplateBinding Background}"
+                                          BorderBrush="{TemplateBinding BorderBrush}"
+                                          BorderThickness="1" Focusable="False"
+                                          IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}"
+                                          ClickMode="Press">
+                                <ToggleButton.Template>
+                                    <ControlTemplate TargetType="ToggleButton">
+                                        <Border Background="{TemplateBinding Background}"
+                                                BorderBrush="{TemplateBinding BorderBrush}"
+                                                BorderThickness="{TemplateBinding BorderThickness}"
+                                                CornerRadius="2">
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition/>
+                                                    <ColumnDefinition Width="18"/>
+                                                </Grid.ColumnDefinitions>
+                                                <Path Grid.Column="1" Data="M0,0 L4,4 8,0" Stroke="White"
+                                                      StrokeThickness="1.5" HorizontalAlignment="Center"
+                                                      VerticalAlignment="Center"/>
+                                            </Grid>
+                                        </Border>
+                                    </ControlTemplate>
+                                </ToggleButton.Template>
+                            </ToggleButton>
+                            <ContentPresenter x:Name="ContentSite"
+                                              Content="{TemplateBinding SelectionBoxItem}"
+                                              ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"
+                                              Margin="6,3,20,3" IsHitTestVisible="False"
+                                              VerticalAlignment="Center" HorizontalAlignment="Left"/>
+                            <Popup x:Name="Popup" IsOpen="{TemplateBinding IsDropDownOpen}"
+                                   Placement="Bottom" Focusable="False" AllowsTransparency="True"
+                                   PopupAnimation="Slide">
+                                <Border x:Name="DropDownBorder" Background="#FF2D2D4A"
+                                        BorderBrush="#FF555577" BorderThickness="1"
+                                        MinWidth="{TemplateBinding ActualWidth}"
+                                        MaxHeight="{TemplateBinding MaxDropDownHeight}"
+                                        CornerRadius="2" Margin="0,1,0,0">
+                                    <ScrollViewer SnapsToDevicePixels="True">
+                                        <StackPanel IsItemsHost="True"
+                                                    KeyboardNavigation.DirectionalNavigation="Contained"/>
+                                    </ScrollViewer>
+                                </Border>
+                            </Popup>
+                        </Grid>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style TargetType="ComboBoxItem">
+            <Setter Property="Background" Value="#FF2D2D4A"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="Padding" Value="6,4"/>
+            <Style.Triggers>
+                <Trigger Property="IsHighlighted" Value="True">
+                    <Setter Property="Background" Value="#FF66CCFF"/>
+                    <Setter Property="Foreground" Value="#FF1A1A2E"/>
+                </Trigger>
+                <Trigger Property="IsSelected" Value="True">
+                    <Setter Property="Background" Value="#FF4A4A6A"/>
+                    <Setter Property="Foreground" Value="#FF66CCFF"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+    </Window.Resources>
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <!-- Top Filter Bar -->
+        <Border Grid.Row="0" Background="#FF252540" Padding="12,8">
+            <DockPanel>
+                <!-- Right side: user info -->
+                <StackPanel DockPanel.Dock="Right" VerticalAlignment="Center" HorizontalAlignment="Right" Margin="12,0,0,0">
+                    <!-- Supporter badge: heart(s) in pink pill -->
+                    <Border x:Name="SupporterBadge" Background="#FFE471A9" CornerRadius="10"
+                            Padding="6,1" HorizontalAlignment="Right" Margin="0,0,0,2"
+                            ClipToBounds="True"
+                            Visibility="Collapsed">
+                        <TextBlock x:Name="SupporterHearts" Text="♥"
+                                   Foreground="White" FontSize="14" FontWeight="Bold"
+                                   HorizontalAlignment="Center" VerticalAlignment="Bottom"
+                                   Margin="0,-5,0,-2"/>
+                    </Border>
+                    <Button x:Name="UserStatusText" Content="" Click="Logout_Click" Cursor="Hand"
+                            Background="Transparent" Foreground="#FF888888"
+                            FontSize="11" BorderThickness="0" Padding="0"
+                            HorizontalAlignment="Right" HorizontalContentAlignment="Right"
+                            ToolTip="Click to logout"/>
+                    <!-- Free: supporter button -->
+                    <Button x:Name="SupporterButton" Content="I'm osu! Supporter"
+                            Click="Supporter_Click"
+                            Background="#FFFF66AB" Foreground="White" FontWeight="Bold" FontSize="11"
+                            Padding="10,4" Cursor="Hand" BorderThickness="0"
+                            HorizontalAlignment="Right"/>
+                </StackPanel>
+
+
+                <!-- Left side: filters -->
+                <StackPanel VerticalAlignment="Center">
+                    <!-- Row 1: mode, status, checkboxes -->
+                    <WrapPanel VerticalAlignment="Center">
+                        <ToggleButton x:Name="ModeOsu" Click="ModeButton_Click" Tag="osu"
+                                      ToolTip="osu!" Width="32" Height="32" Margin="0,0,2,0" Cursor="Hand"
+                                      Background="Transparent" BorderThickness="0">
+                            <Image Source="assets/mode-osu.png" Width="20" Height="20" Opacity="0.5"/>
+                        </ToggleButton>
+                        <ToggleButton x:Name="ModeTaiko" Click="ModeButton_Click" Tag="taiko"
+                                      ToolTip="taiko" Width="32" Height="32" Margin="0,0,2,0" Cursor="Hand"
+                                      Background="Transparent" BorderThickness="0">
+                            <Image Source="assets/mode-taiko.png" Width="20" Height="20" Opacity="0.5"/>
+                        </ToggleButton>
+                        <ToggleButton x:Name="ModeCatch" Click="ModeButton_Click" Tag="catch"
+                                      ToolTip="catch" Width="32" Height="32" Margin="0,0,2,0" Cursor="Hand"
+                                      Background="Transparent" BorderThickness="0">
+                            <Image Source="assets/mode-fruits.png" Width="20" Height="20" Opacity="0.5"/>
+                        </ToggleButton>
+                        <ToggleButton x:Name="ModeMania" Click="ModeButton_Click" Tag="mania"
+                                      ToolTip="mania" Width="32" Height="32" Margin="0,0,12,0" Cursor="Hand"
+                                      Background="Transparent" BorderThickness="0">
+                            <Image Source="assets/mode-mania.png" Width="20" Height="20" Opacity="0.5"/>
+                        </ToggleButton>
+
+                        <TextBlock Text="Status:" Foreground="#FFAAAAAA" VerticalAlignment="Center" Margin="0,0,6,0" FontSize="12"/>
+                        <ComboBox x:Name="StatusCombo" Width="100"
+                                  SelectedValue="{Binding SelectedStatus}"
+                                  SelectedValuePath="Content"
+                                  Background="#FF3D3D5C" Foreground="White" FontSize="12" Margin="0,0,16,0">
+                            <ComboBoxItem Content="ranked" IsSelected="True"/>
+                            <ComboBoxItem Content="qualified"/>
+                            <ComboBoxItem Content="loved"/>
+                            <ComboBoxItem Content="pending"/>
+                            <ComboBoxItem Content="graveyard"/>
+                            <ComboBoxItem Content="any"/>
+                        </ComboBox>
+
+                        <CheckBox Content="No Video" IsChecked="{Binding NoVideo}"
+                                  Foreground="#FFCCCCCC" VerticalAlignment="Center" Margin="0,0,16,0" FontSize="12"/>
+
+                        <CheckBox Content="Auto Install" IsChecked="{Binding AutoInstall}"
+                                  Foreground="#FFCCCCCC" VerticalAlignment="Center" Margin="0,0,16,0" FontSize="12"/>
+
+                        <CheckBox x:Name="ShowDownloadedCheck" Content="Show Downloaded"
+                                  IsChecked="{Binding ShowDownloaded}"
+                                  Foreground="#FFCCCCCC" VerticalAlignment="Center" Margin="0,0,8,0" FontSize="12"
+                                  Visibility="Collapsed"/>
+
+                        <Button Content="⚙" Click="Settings_Click" FontSize="16"
+                                Background="Transparent" Foreground="#FFAAAAAA"
+                                BorderThickness="0" Cursor="Hand" Margin="0,0,0,0"
+                                ToolTip="Settings" VerticalAlignment="Center"/>
+                    </WrapPanel>
+
+                    <!-- Row 2: search bar -->
+                    <Grid Margin="0,6,0,0" HorizontalAlignment="Left" Width="350">
+                        <TextBox x:Name="SearchBox" Text="{Binding SearchQuery, UpdateSourceTrigger=PropertyChanged}"
+                                 Background="#FF3D3D5C" Foreground="White" BorderBrush="#FF555577"
+                                 Padding="8,5" FontSize="12" TextChanged="SearchBox_TextChanged"/>
+                        <TextBlock x:Name="SearchPlaceholder" Text="Search beatmaps..."
+                                   Foreground="#FF666688" FontSize="12" IsHitTestVisible="False"
+                                   VerticalAlignment="Center" Margin="10,0,0,0"/>
+                    </Grid>
+                </StackPanel>
+            </DockPanel>
+        </Border>
+
+        <!-- Main Content -->
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="7*"/>
+                <ColumnDefinition Width="3*"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- Beatmap panel with Download All header -->
+            <Grid Grid.Column="0">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+
+                <!-- Download All button aligned right -->
+                <Button x:Name="DownloadAllButton" Grid.Row="0" Content="⬇ Download All"
+                        Click="DownloadAll_Click"
+                        Background="#FF3D3D5C" Foreground="#FF66CCFF" FontSize="12" FontWeight="SemiBold"
+                        BorderThickness="0" Cursor="Hand" Padding="12,5" Margin="0,6,8,4"
+                        HorizontalAlignment="Right" VerticalAlignment="Center"
+                        ToolTip="Download all loaded beatmaps" Visibility="Collapsed"/>
+
+            <!-- Beatmap List -->
+            <ListBox Grid.Row="1" x:Name="BeatmapList"
+                     ItemsSource="{Binding Beatmaps}"
+                     Background="Transparent" BorderThickness="0"
+                     ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                     ScrollViewer.ScrollChanged="BeatmapList_ScrollChanged"
+                     VirtualizingPanel.IsVirtualizing="True"
+                     VirtualizingPanel.VirtualizationMode="Recycling">
+                <ListBox.ItemContainerStyle>
+                    <Style TargetType="ListBoxItem">
+                        <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+                        <Setter Property="Padding" Value="0"/>
+                        <Setter Property="Margin" Value="4,2"/>
+                        <Setter Property="Template">
+                            <Setter.Value>
+                                <ControlTemplate TargetType="ListBoxItem">
+                                    <Border x:Name="Bd" Background="#FF252540" CornerRadius="4"
+                                            Padding="0" Cursor="Hand">
+                                        <ContentPresenter/>
+                                    </Border>
+                                    <ControlTemplate.Triggers>
+                                        <Trigger Property="IsMouseOver" Value="True">
+                                            <Setter TargetName="Bd" Property="Background" Value="#FF353555"/>
+                                        </Trigger>
+                                    </ControlTemplate.Triggers>
+                                </ControlTemplate>
+                            </Setter.Value>
+                        </Setter>
+                    </Style>
+                </ListBox.ItemContainerStyle>
+                <ListBox.ItemTemplate>
+                    <DataTemplate>
+                        <Grid Height="64" Margin="0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="90"/>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+
+                            <!-- Cover Image -->
+                            <Border Grid.Column="0" CornerRadius="4,0,0,4" ClipToBounds="True"
+                                    PreviewMouseLeftButtonDown="BeatmapInfo_Click"
+                                    Background="Transparent">
+                                <Image Source="{Binding CoverUrl}" Stretch="UniformToFill"
+                                       RenderOptions.BitmapScalingMode="HighQuality"/>
+                            </Border>
+
+                            <!-- Info (clickable for preview) -->
+                            <Grid Grid.Column="1" Margin="10,8"
+                                  PreviewMouseLeftButtonDown="BeatmapInfo_Click"
+                                  Background="Transparent">
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                </Grid.RowDefinitions>
+
+                                <StackPanel Grid.Row="0" Orientation="Horizontal" VerticalAlignment="Center">
+                                    <TextBlock Text="{Binding Title}" Foreground="White"
+                                               FontSize="14" FontWeight="SemiBold"
+                                               TextTrimming="CharacterEllipsis" MaxWidth="400"/>
+                                    <TextBlock Text=" - " Foreground="#FF888888" FontSize="14"/>
+                                    <TextBlock Text="{Binding Artist}" Foreground="#FFBBBBBB"
+                                               FontSize="14" TextTrimming="CharacterEllipsis" MaxWidth="200"/>
+                                </StackPanel>
+
+                                <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,3,0,0">
+                                    <Border Background="{Binding Status, Converter={StaticResource StatusToColor}}"
+                                            CornerRadius="3" Padding="6,1" Margin="0,0,8,0">
+                                        <TextBlock Text="{Binding Status}" Foreground="#FF1A1A2E"
+                                                   FontSize="10" FontWeight="Bold"/>
+                                    </Border>
+                                    <TextBlock Text="{Binding DateText}"
+                                               Foreground="#FF999999" FontSize="10" VerticalAlignment="Center"
+                                               Margin="0,0,10,0"/>
+                                    <TextBlock Text="{Binding Creator, StringFormat='by {0}'}"
+                                               Foreground="#FF888888" FontSize="11" VerticalAlignment="Center"
+                                               Margin="0,0,10,0"/>
+                                    <TextBlock Text="{Binding StarRangeText}"
+                                               Foreground="#FFFFCC66" FontSize="11" VerticalAlignment="Center"/>
+                                </StackPanel>
+                            </Grid>
+
+                            <!-- Download Button (visible when not queued and not downloaded) -->
+                            <Button Grid.Column="2" Content="⬇" FontSize="18"
+                                    Width="48" Height="48"
+                                    Click="DownloadButton_Click"
+                                    Command="{Binding DataContext.DownloadCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                    CommandParameter="{Binding}"
+                                    Visibility="{Binding ShowDownloadButton, Converter={StaticResource BoolToVisibility}}"
+                                    Background="#FF3D3D5C" Foreground="#FF66CCFF"
+                                    BorderThickness="0" Cursor="Hand" Margin="0,0,8,0"
+                                    ToolTip="Download">
+                                <Button.Template>
+                                    <ControlTemplate TargetType="Button">
+                                        <Border x:Name="Bd" Background="{TemplateBinding Background}"
+                                                CornerRadius="4" Width="{TemplateBinding Width}"
+                                                Height="{TemplateBinding Height}">
+                                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                        </Border>
+                                        <ControlTemplate.Triggers>
+                                            <Trigger Property="IsMouseOver" Value="True">
+                                                <Setter TargetName="Bd" Property="Background" Value="#FF66CCFF"/>
+                                                <Setter Property="Foreground" Value="#FF1A1A2E"/>
+                                            </Trigger>
+                                        </ControlTemplate.Triggers>
+                                    </ControlTemplate>
+                                </Button.Template>
+                            </Button>
+
+                            <!-- Queued checkmark -->
+                            <TextBlock Grid.Column="2" Text="✓" FontSize="18"
+                                       Foreground="#FF68C3A3" HorizontalAlignment="Center" VerticalAlignment="Center"
+                                       Margin="0,0,8,0"
+                                       Visibility="{Binding IsQueued, Converter={StaticResource BoolToVisibility}}"/>
+
+                            <!-- Downloaded label -->
+                            <TextBlock Grid.Column="2" Text="Downloaded" FontSize="10"
+                                       Foreground="#FF666688" HorizontalAlignment="Center" VerticalAlignment="Center"
+                                       Margin="0,0,8,0"
+                                       Visibility="{Binding IsDownloaded, Converter={StaticResource BoolToVisibility}}"/>
+
+                            <!-- Green flash overlay -->
+                            <Border x:Name="FlashOverlay" Grid.ColumnSpan="3" CornerRadius="4"
+                                    Background="#FF68C3A3" Opacity="0" IsHitTestVisible="False"/>
+                        </Grid>
+                    </DataTemplate>
+                </ListBox.ItemTemplate>
+            </ListBox>
+
+                <!-- Loading Indicator -->
+                <TextBlock Grid.Row="1" Text="Loading..." Foreground="#FF66CCFF" FontSize="14"
+                           HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="0,0,0,20"
+                           Visibility="{Binding IsLoading, Converter={StaticResource BoolToVisibility}}"/>
+
+                <!-- All downloaded hint -->
+                <TextBlock Grid.Row="1" Text="All beatmaps here are already downloaded. Enable 'Show Downloaded' to see them."
+                           Foreground="#FF888888" FontSize="12" TextWrapping="Wrap" TextAlignment="Center"
+                           HorizontalAlignment="Center" VerticalAlignment="Center" Margin="40,0"
+                           Visibility="{Binding AllDownloadedHint, Converter={StaticResource BoolToVisibility}}"/>
+            </Grid>
+
+            <!-- Right Panel: Download Queue -->
+            <Border Grid.Column="1" Background="#FF202035" BorderBrush="#FF333355"
+                    BorderThickness="1,0,0,0">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+
+                    <StackPanel Grid.Row="0" Margin="12,12,12,4">
+                        <DockPanel>
+                            <Button DockPanel.Dock="Right" Content="Cancel All"
+                                    Command="{Binding CancelAllCommand}"
+                                    Background="Transparent" Foreground="#FFFF6666" FontSize="10"
+                                    BorderThickness="0" Cursor="Hand" Padding="4,0"
+                                    ToolTip="Cancel all downloads" VerticalAlignment="Center"/>
+                            <TextBlock Text="Download Queue" Foreground="#FFCCCCCC"
+                                       FontSize="14" FontWeight="SemiBold"/>
+                        </DockPanel>
+                        <TextBlock x:Name="RateLimitText" Foreground="#FF888888"
+                                   FontSize="10" Margin="0,2,0,4"/>
+                    </StackPanel>
+
+                    <ListBox Grid.Row="1" ItemsSource="{Binding DownloadQueue}"
+                             Background="Transparent" BorderThickness="0"
+                             ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                        <ListBox.ItemContainerStyle>
+                            <Style TargetType="ListBoxItem">
+                                <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+                                <Setter Property="Padding" Value="0"/>
+                                <Setter Property="Margin" Value="6,2"/>
+                                <Setter Property="IsHitTestVisible" Value="True"/>
+                                <Setter Property="Focusable" Value="False"/>
+                                <Setter Property="Template">
+                                    <Setter.Value>
+                                        <ControlTemplate TargetType="ListBoxItem">
+                                            <ContentPresenter/>
+                                        </ControlTemplate>
+                                    </Setter.Value>
+                                </Setter>
+                            </Style>
+                        </ListBox.ItemContainerStyle>
+                        <ListBox.ItemTemplate>
+                            <DataTemplate>
+                                <Border Background="#FF2A2A45" CornerRadius="4" Padding="10,8" Margin="0,1">
+                                    <Grid>
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto"/>
+                                            <RowDefinition Height="Auto"/>
+                                        </Grid.RowDefinitions>
+
+                                        <DockPanel Grid.Row="0">
+                                            <!-- Cancel/remove button -->
+                                            <Button DockPanel.Dock="Right" Content="✕" FontSize="10"
+                                                    Command="{Binding DataContext.CancelCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                    CommandParameter="{Binding}"
+                                                    Background="Transparent" Foreground="#FF888888"
+                                                    BorderThickness="0" Cursor="Hand" Margin="4,0,0,0"
+                                                    ToolTip="Cancel" Padding="2,0"/>
+                                            <TextBlock DockPanel.Dock="Right"
+                                                       Text="{Binding ProgressText}"
+                                                       Foreground="{Binding Status, Converter={StaticResource DownloadStatusToColor}}"
+                                                       FontSize="11" VerticalAlignment="Center"/>
+                                            <!-- Retry button for failed -->
+                                            <Button DockPanel.Dock="Right" Content="↻" FontSize="12"
+                                                    Visibility="{Binding Status, Converter={StaticResource DownloadStatusToVisibility}, ConverterParameter=Failed}"
+                                                    Command="{Binding DataContext.RetryCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                    CommandParameter="{Binding}"
+                                                    Background="Transparent" Foreground="#FFFFCC66"
+                                                    BorderThickness="0" Cursor="Hand" Margin="0,0,6,0"
+                                                    ToolTip="Retry" Padding="4,0"/>
+                                            <TextBlock Text="{Binding DisplayName}"
+                                                       Foreground="#FFDDDDDD" FontSize="12"
+                                                       TextTrimming="CharacterEllipsis"/>
+                                        </DockPanel>
+
+                                        <!-- Progress Bar -->
+                                        <Grid Grid.Row="1" Height="3" Margin="0,5,0,0"
+                                              Visibility="{Binding Status, Converter={StaticResource DownloadStatusToVisibility}, ConverterParameter=Downloading}">
+                                            <Border Background="#FF3D3D5C" CornerRadius="2"/>
+                                            <Border Background="#FF66CCFF" CornerRadius="2"
+                                                    HorizontalAlignment="Left">
+                                                <Border.Width>
+                                                    <MultiBinding>
+                                                        <MultiBinding.Converter>
+                                                            <conv:ProgressToWidthConverter/>
+                                                        </MultiBinding.Converter>
+                                                        <Binding Path="Progress"/>
+                                                        <Binding Path="ActualWidth" RelativeSource="{RelativeSource AncestorType=Grid}"/>
+                                                    </MultiBinding>
+                                                </Border.Width>
+                                            </Border>
+                                        </Grid>
+                                    </Grid>
+                                </Border>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+
+                    <!-- Empty Queue Message -->
+                    <TextBlock Grid.Row="1" Text="No downloads"
+                               Foreground="#FF555577" FontSize="12"
+                               HorizontalAlignment="Center" VerticalAlignment="Center">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock">
+                                <Setter Property="Visibility" Value="Collapsed"/>
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding DownloadQueue.Count}" Value="0">
+                                        <Setter Property="Visibility" Value="Visible"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
+                </Grid>
+            </Border>
+        </Grid>
+    </Grid>
+</Window>

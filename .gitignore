@@ -1,0 +1,27 @@
+# Build output
+bin/
+obj/
+
+# IDE
+.vs/
+.vscode/
+*.user
+*.suo
+
+# OS files
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Application data (generated at runtime)
+data/
+
+# osu! source reference (not part of this project)
+osu-master/
+
+# NuGet
+*.nupkg
+packages/
+
+# Superpowers plugin data
+.superpowers/
