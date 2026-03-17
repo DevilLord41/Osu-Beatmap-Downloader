@@ -168,10 +168,9 @@
                         <CheckBox Content="Auto Install" IsChecked="{Binding AutoInstall}"
                                   Foreground="#FFCCCCCC" VerticalAlignment="Center" Margin="0,0,16,0" FontSize="12"/>
 
-                        <CheckBox x:Name="ShowDownloadedCheck" Content="Show Downloaded"
+                        <CheckBox Content="Show Downloaded"
                                   IsChecked="{Binding ShowDownloaded}"
-                                  Foreground="#FFCCCCCC" VerticalAlignment="Center" Margin="0,0,8,0" FontSize="12"
-                                  Visibility="Collapsed"/>
+                                  Foreground="#FFCCCCCC" VerticalAlignment="Center" Margin="0,0,8,0" FontSize="12"/>
 
                         <Button Content="⚙" Click="Settings_Click" FontSize="16"
                                 Background="Transparent" Foreground="#FFAAAAAA"
@@ -344,7 +343,7 @@
             </ListBox>
 
                 <!-- Loading Indicator -->
-                <TextBlock Grid.Row="1" Text="Loading..." Foreground="#FF66CCFF" FontSize="14"
+                <TextBlock Grid.Row="1" Text="{Binding LoadingText}" Foreground="#FF66CCFF" FontSize="14"
                            HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="0,0,0,20"
                            Visibility="{Binding IsLoading, Converter={StaticResource BoolToVisibility}}"/>
 

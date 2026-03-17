@@ -29,14 +29,14 @@ public class MainViewModel : BaseViewModel
 
     private readonly Dictionary<string, FilterCache> _cache = new();
 
-    // Persisted cache — saves full results + cursor to disk
+    // Persisted cache — saves only cursor positions + seen IDs (lightweight)
     private static readonly string DiskCachePath = Services.DataPaths.SearchCacheFile;
 
     private class DiskCacheEntry
     {
-        public List<BeatmapSet> AllResults { get; set; } = new();
         public string? CursorString { get; set; }
         public bool HasMore { get; set; } = true;
+        public List<BeatmapSet> VisibleResults { get; set; } = new();
     }
 
     private void LoadDiskCache()
@@ -55,7 +55,8 @@ public class MainViewModel : BaseViewModel
                     CursorString = entry.CursorString,
                     HasMore = entry.HasMore
                 };
-                cache.AllResults.AddRange(entry.AllResults);
+                // Restore visible results (non-downloaded maps from previous session)
+                cache.AllResults.AddRange(entry.VisibleResults);
                 _cache[key] = cache;
             }
         }
@@ -66,19 +67,17 @@ public class MainViewModel : BaseViewModel
     {
         try
         {
-            // Only save caches that have meaningful data (>50 results means we paged through downloads)
             var toSave = new Dictionary<string, DiskCacheEntry>();
             foreach (var (key, cache) in _cache)
             {
-                if (cache.AllResults.Count > 0)
+                if (cache.CursorString == null && cache.AllResults.Count == 0) continue;
+
+                toSave[key] = new DiskCacheEntry
                 {
-                    toSave[key] = new DiskCacheEntry
-                    {
-                        AllResults = cache.AllResults,
-                        CursorString = cache.CursorString,
-                        HasMore = cache.HasMore
-                    };
-                }
+                    CursorString = cache.CursorString,
+                    HasMore = cache.HasMore,
+                    VisibleResults = cache.AllResults
+                };
             }
             var json = Newtonsoft.Json.JsonConvert.SerializeObject(toSave);
             Services.SecureStorage.WriteEncrypted(DiskCachePath, json);
@@ -175,6 +174,13 @@ public class MainViewModel : BaseViewModel
     {
         get => _isLoading;
         set => SetField(ref _isLoading, value);
+    }
+
+    private string _loadingText = "Loading...";
+    public string LoadingText
+    {
+        get => _loadingText;
+        set => SetField(ref _loadingText, value);
     }
 
     public bool IsSupporter { get; }
@@ -280,7 +286,7 @@ public class MainViewModel : BaseViewModel
         Beatmaps.Clear();
 
         // Try to restore from cache
-        var showDownloaded = ShowDownloaded && IsSupporter;
+        var showDownloaded = ShowDownloaded;
         var filter = _activeFilter;
         var cache = GetOrCreateCache();
 
@@ -328,6 +334,7 @@ public class MainViewModel : BaseViewModel
             return;
         }
         IsLoading = true;
+        LoadingText = "Loading...";
 
         var mode = _activeMode;
         var status = _activeStatus;
@@ -335,13 +342,16 @@ public class MainViewModel : BaseViewModel
 
         try
         {
-            var showDl = ShowDownloaded && IsSupporter;
+            var showDl = ShowDownloaded;
             var filter = _activeFilter;
             var visibleBefore = Beatmaps.Count;
+            var loadStart = DateTime.UtcNow;
 
             // Keep fetching until we have new visible results or API is exhausted
             while (cache.HasMore)
             {
+                if ((DateTime.UtcNow - loadStart).TotalSeconds >= 3 && Beatmaps.Count == visibleBefore)
+                    LoadingText = "Loading... (takes longer, seems you already have a lot of maps)";
                 if (ct.IsCancellationRequested) return;
 
                 var result = await _api.SearchBeatmapsAsync(

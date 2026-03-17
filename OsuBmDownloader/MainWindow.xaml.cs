@@ -132,7 +132,6 @@ public partial class MainWindow : Window
         {
             SupporterButton.Visibility = Visibility.Collapsed;
             SupporterBadge.Visibility = Visibility.Visible;
-            ShowDownloadedCheck.Visibility = Visibility.Visible;
             DownloadAllButton.Visibility = Visibility.Visible;
 
             // Show hearts based on support level (1-3)
@@ -148,7 +147,6 @@ public partial class MainWindow : Window
         {
             SupporterButton.Visibility = Visibility.Visible;
             SupporterBadge.Visibility = Visibility.Collapsed;
-            ShowDownloadedCheck.Visibility = Visibility.Collapsed;
             DownloadAllButton.Visibility = Visibility.Collapsed;
             UserStatusText.Content = settings.IsLoggedIn ? settings.Username : "";
             UserStatusText.Visibility = settings.IsLoggedIn ? Visibility.Visible : Visibility.Collapsed;
