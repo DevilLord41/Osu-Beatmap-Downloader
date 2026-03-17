@@ -11,8 +11,9 @@ A Windows desktop app that replicates osu!direct functionality, allowing you to 
 - Auto-install: extracts .osz and moves to your osu! Songs folder
 - Preview audio playback (supports both MP3 and OGG formats)
 - Smart caching: beatmap results cached in memory and on disk for instant mode switching
-- Automatic mirror fallback (catboy.best + nerinyan.moe)
+- Automatic mirror fallback (catboy.best + nerinyan.moe + sayobot)
 - Hides already-downloaded beatmaps (scans your osu! Songs folder)
+- "Show Downloaded" toggle to see already-downloaded maps
 - Download queue persistence (resumes on app restart)
 - Encrypted settings storage (Windows DPAPI)
 
@@ -20,7 +21,6 @@ A Windows desktop app that replicates osu!direct functionality, allowing you to 
 
 - Unlimited downloads (free users: 30 per hour)
 - Preview audio on click
-- "Show Downloaded" toggle to see already-downloaded maps
 - "Download All" button (up to 100 maps at once)
 - Supporter heart badge
 
