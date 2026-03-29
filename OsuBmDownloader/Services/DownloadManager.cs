@@ -185,7 +185,11 @@ public class DownloadManager
     public void Cancel(DownloadItem item)
     {
         item.Cts.Cancel();
-        AllItems.Remove(item);
+        // Don't remove immediately — let the background task clean up via finally block
+        // Just mark as failed so user sees feedback
+        if (item.Status != DownloadStatus.Completed)
+            item.Status = DownloadStatus.Failed;
+        Application.Current.Dispatcher.BeginInvoke(() => AllItems.Remove(item));
     }
 
     public void CancelAll()
@@ -194,7 +198,7 @@ public class DownloadManager
         {
             item.Cts.Cancel();
         }
-        AllItems.Clear();
+        Application.Current.Dispatcher.BeginInvoke(() => AllItems.Clear());
     }
 
     private void UpdateUI(Action action)
@@ -204,12 +208,15 @@ public class DownloadManager
 
     private async Task DownloadItemAsync(DownloadItem item, bool noVideo, bool autoInstall)
     {
-        await _semaphore.WaitAsync().ConfigureAwait(false);
+        bool semaphoreAcquired = false;
         var ct = item.Cts.Token;
         string? filePath = null;
 
         try
         {
+            await _semaphore.WaitAsync(ct).ConfigureAwait(false);
+            semaphoreAcquired = true;
+
             if (ct.IsCancellationRequested) return;
 
             var sanitizedArtist = SanitizeFileName(item.Artist);
@@ -308,7 +315,8 @@ public class DownloadManager
         }
         finally
         {
-            _semaphore.Release();
+            if (semaphoreAcquired)
+                _semaphore.Release();
         }
     }
 
