@@ -419,8 +419,13 @@ public class DownloadManager
             long totalRead = 0;
             int bytesRead;
 
-            while ((bytesRead = await downloadStream.ReadAsync(buffer, ct).ConfigureAwait(false)) > 0)
+            while (true)
             {
+                // Per-read timeout: if no data received for 30s, abort and try next mirror
+                using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                readCts.CancelAfter(TimeSpan.FromSeconds(30));
+                bytesRead = await downloadStream.ReadAsync(buffer, readCts.Token).ConfigureAwait(false);
+                if (bytesRead == 0) break;
                 await fileStream.WriteAsync(buffer.AsMemory(0, bytesRead), ct).ConfigureAwait(false);
                 totalRead += bytesRead;
 

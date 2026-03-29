@@ -27,8 +27,9 @@ public partial class MainWindow : Window
 
     private void MainWindow_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
     {
-        _viewModel?.GetDownloadManager().SaveQueue(_viewModel.NoVideo, _viewModel.AutoInstall);
-        _viewModel?.SaveState();
+        if (_viewModel == null) return;
+        _viewModel.GetDownloadManager().SaveQueue(_viewModel.NoVideo, _viewModel.AutoInstall);
+        _viewModel.SaveState();
     }
 
     private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
