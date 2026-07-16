@@ -1,14 +1,23 @@
 # osu! Beatmap Downloader
 
-A Windows desktop app that replicates osu!direct functionality, allowing you to browse, search, filter, and download osu! beatmaps with ease.
+A fast native Windows desktop app that replicates osu!direct functionality, allowing you to browse, search, filter, and download osu! beatmaps with ease.
 
-![screenshot](screenshot.png)
+Version 2.0 is a complete rework of the original .NET/WPF application in Rust, with an optimized native build and a brand-new modern interface.
 
 Made by [HardRockMania](https://osu.ppy.sh/u/hardrockmania)
 
 ## Download
 
 Grab the latest release from the [Releases page](https://github.com/DevilLord41/Osu-Beatmap-Downloader/releases). Extract the zip and run `OsuBmDownloader.exe` — no installation required.
+
+## What's New in 2.0
+
+- Completely rewritten from C#/.NET and WPF in Rust 2024
+- Optimized native Windows release with WGPU rendering, thin LTO, and stripped symbols
+- Brand-new minimal dark interface with modern controls, compact download cards, and responsive layouts
+- Asynchronous API, cover, audio, and download work powered by Tokio
+- Safer downloads with mirror fallback, archive limits, and transactional installation
+- Backward-compatible DPAPI storage, so existing v1 settings and application state continue to work
 
 ## Features
 
@@ -19,6 +28,7 @@ Grab the latest release from the [Releases page](https://github.com/DevilLord41/
 - Auto-install: extracts .osz and moves to your osu! Songs folder
 - Preview audio playback (supports both MP3 and OGG formats)
 - Smart caching: beatmap results cached in memory and on disk for instant mode switching
+- Qualified maps refresh from the first page so status changes are immediately visible
 - Automatic mirror fallback (catboy.best + nerinyan.moe + sayobot)
 - Hides already-downloaded beatmaps (scans your osu! Songs folder)
 - "Show Downloaded" toggle to see already-downloaded maps
@@ -30,11 +40,11 @@ Grab the latest release from the [Releases page](https://github.com/DevilLord41/
 - Unlimited downloads (free users: 30 per hour)
 - Preview audio on click
 - "Download All" button (up to 100 maps at once)
-- Supporter heart badge
+- Supporter account badge
 
 ## Prerequisites
 
-- **Windows 10/11** (required for WPF and DPAPI)
+- **Windows 10/11** (required for native rendering and DPAPI)
 - **osu! API v2 credentials** - You'll need a Client ID and Client Secret
 
 ## Getting osu! API Credentials
@@ -69,50 +79,56 @@ Example: `shuniki star>=5 & star<=10` - Search for "shuniki" with 5-10 star maps
 
 ## Tech Stack
 
-- C# / .NET 8
-- WPF (Windows Presentation Foundation)
+- Rust 2024
+- eframe/egui with native WGPU rendering
+- Tokio + reqwest for asynchronous API and download work
 - osu! API v2 (OAuth2)
-- NAudio + NAudio.Vorbis (audio playback)
-- Windows DPAPI (encrypted storage)
+- Rodio for MP3 and OGG playback
+- Windows DPAPI for encrypted, backward-compatible storage
 
 ## Building from Source
 
-### 1. Install .NET 8 SDK
+### 1. Install Rust
 
-Download and install from: https://dotnet.microsoft.com/download/dotnet/8.0
+Install Rust with [rustup](https://rustup.rs/). The supported toolchain is pinned in `rust-toolchain.toml`.
 
 Verify installation:
-```bash
-dotnet --version
+```powershell
+rustc --version
+cargo --version
 ```
 
 ### 2. Clone the repository
 
-```bash
+```powershell
 git clone https://github.com/DevilLord41/Osu-Beatmap-Downloader.git
 cd Osu-Beatmap-Downloader
 ```
 
-### 3. Restore and build
+### 3. Build and test
 
-```bash
-dotnet restore
-dotnet build
+```powershell
+cargo test --all-targets
+cargo build --release
 ```
 
 ### 4. Run
 
-```bash
-dotnet run --project OsuBmDownloader
+```powershell
+cargo run
 ```
 
-### Publishing a self-contained release
+### Release executable
 
-```bash
-dotnet publish OsuBmDownloader/OsuBmDownloader.csproj -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish
+```powershell
+cargo build --release --locked --target x86_64-pc-windows-msvc
 ```
 
-This produces a single `OsuBmDownloader.exe` in the `publish/` folder with all dependencies bundled.
+This produces `target/x86_64-pc-windows-msvc/release/OsuBmDownloader.exe`. Pushing a `v*` tag runs formatting, lint, and tests before publishing the Windows ZIP release.
+
+## Upgrading from v1 (.NET)
+
+Keep the existing `data` folder beside `OsuBmDownloader.exe`. The Rust application reads the same DPAPI-encrypted settings, rate-limit history, download queue, and search cache files, preserving API credentials and application state for the same Windows user.
 
 ## License
 

@@ -16,26 +16,45 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup .NET 8
-        uses: actions/setup-dotnet@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          dotnet-version: '8.0.x'
+          toolchain: '1.97.0'
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
 
-      - name: Restore dependencies
-        run: dotnet restore
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
 
-      - name: Build
-        run: dotnet build -c Release --no-restore
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
-      - name: Publish self-contained single-file
-        run: dotnet publish OsuBmDownloader/OsuBmDownloader.csproj -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish
+      - name: Lint
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets --locked
+
+      - name: Verify release version
+        id: version
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            throw "Tag ${{ github.ref_name }} does not match Cargo version v$version"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Build native Windows executable
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
 
       - name: Zip release
-        run: Compress-Archive -Path publish/* -DestinationPath OsuBmDownloader-${{ github.ref_name }}-win-x64.zip
+        run: Compress-Archive -Path target/x86_64-pc-windows-msvc/release/OsuBmDownloader.exe -DestinationPath OsuBmDownloader-${{ github.ref_name }}-win-x64.zip
         shell: pwsh
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          name: ${{ steps.version.outputs.version }}
           files: OsuBmDownloader-${{ github.ref_name }}-win-x64.zip
           generate_release_notes: true

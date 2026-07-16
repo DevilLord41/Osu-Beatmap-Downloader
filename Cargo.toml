@@ -1,0 +1,43 @@
+[package]
+name = "osu-beatmap-downloader"
+version = "2.0.0"
+edition = "2024"
+rust-version = "1.92"
+description = "Native osu! beatmap browser and downloader"
+
+[[bin]]
+name = "OsuBmDownloader"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+eframe = { version = "0.35.0", default-features = false, features = ["wgpu", "default_fonts", "accesskit"] }
+egui_extras = { version = "0.35.0", features = ["image"] }
+futures-util = "0.3"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+open = { version = "5.4", features = ["shellexecute-on-windows"] }
+rand = "0.9"
+regex = "1.12"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "form", "stream", "system-proxy", "gzip", "brotli"] }
+rfd = "0.17.2"
+rodio = { version = "0.22.2", default-features = false, features = ["playback", "mp3", "vorbis"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs", "io-util"] }
+tokio-util = { version = "0.7.18", features = ["rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2.5"
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Memory", "Win32_UI_WindowsAndMessaging"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[dev-dependencies]
+tempfile = "3.23"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
