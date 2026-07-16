@@ -29,7 +29,7 @@ public class MainViewModel : BaseViewModel
 
     private readonly Dictionary<string, FilterCache> _cache = new();
 
-    // Persisted cache — saves only cursor positions + seen IDs (lightweight)
+    // Persisted cache stores search results and pagination state for quick restoration.
     private static readonly string DiskCachePath = Services.DataPaths.SearchCacheFile;
 
     private class DiskCacheEntry
@@ -284,6 +284,11 @@ public class MainViewModel : BaseViewModel
         IsLoading = false;
         AllDownloadedHint = false;
         Beatmaps.Clear();
+
+        // Qualified maps frequently change status, and resuming an old cursor misses
+        // new maps added at the start of the result set.
+        if (_activeStatus == "qualified")
+            _cache.Remove(CacheKey);
 
         // Try to restore from cache
         var showDownloaded = ShowDownloaded;
