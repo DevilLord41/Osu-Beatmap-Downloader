@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -59,6 +60,7 @@ impl TokenState {
 pub struct OsuApiClient {
     client: Client,
     settings: Arc<RwLock<AppSettings>>,
+    settings_version: Arc<AtomicU64>,
     token: Arc<tokio::sync::Mutex<TokenState>>,
     paths: DataPaths,
 }
@@ -93,6 +95,7 @@ impl OsuApiClient {
         Ok(Self {
             client,
             settings: Arc::new(RwLock::new(settings)),
+            settings_version: Arc::new(AtomicU64::new(0)),
             token: Arc::new(tokio::sync::Mutex::new(token)),
             paths,
         })
@@ -105,12 +108,49 @@ impl OsuApiClient {
             .clone()
     }
 
-    pub async fn replace_settings(&self, settings: AppSettings) {
+    pub fn settings_version(&self) -> u64 {
+        self.settings_version.load(Ordering::Acquire)
+    }
+
+    fn store_settings(&self, settings: AppSettings) {
         *self
             .settings
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = settings;
-        *self.token.lock().await = TokenState::default();
+        self.settings_version.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub async fn replace_settings(&self, settings: AppSettings) {
+        let credentials_changed = {
+            let current = self
+                .settings
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            current.client_id != settings.client_id
+                || current.client_secret != settings.client_secret
+        };
+        self.store_settings(settings);
+        if credentials_changed {
+            *self.token.lock().await = TokenState::default();
+        }
+    }
+
+    pub fn update_preferences(
+        &self,
+        prefer_no_video: bool,
+        auto_install: bool,
+    ) -> anyhow::Result<()> {
+        let settings = {
+            let mut settings = self
+                .settings
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            settings.prefer_no_video = prefer_no_video;
+            settings.auto_install = auto_install;
+            self.settings_version.fetch_add(1, Ordering::AcqRel);
+            settings.clone()
+        };
+        storage::save_settings(&self.paths, &settings)
     }
 
     pub async fn authenticate(&self) -> Result<(), ApiError> {
@@ -213,10 +253,7 @@ impl OsuApiClient {
         settings.is_logged_in = true;
         settings.is_supporter = user.is_supporter;
         settings.support_level = user.support_level;
-        *self
-            .settings
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = settings.clone();
+        self.store_settings(settings.clone());
         storage::save_settings(&self.paths, &settings)?;
         Ok(settings)
     }
@@ -229,10 +266,7 @@ impl OsuApiClient {
         settings.support_level = 0;
         settings.user_access_token = None;
         settings.user_token_expiry = None;
-        *self
-            .settings
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = settings.clone();
+        self.store_settings(settings.clone());
         storage::save_settings(&self.paths, &settings)?;
         Ok(settings)
     }
@@ -285,10 +319,7 @@ impl OsuApiClient {
         let mut settings = self.settings();
         settings.user_access_token = Some(response.access_token);
         settings.user_token_expiry = Some(expiry);
-        *self
-            .settings
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = settings.clone();
+        self.store_settings(settings.clone());
         storage::save_settings(&self.paths, &settings)?;
 
         let user = self.get_me().await?;
@@ -296,10 +327,7 @@ impl OsuApiClient {
         settings.is_logged_in = true;
         settings.is_supporter = user.is_supporter;
         settings.support_level = user.support_level;
-        *self
-            .settings
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = settings.clone();
+        self.store_settings(settings.clone());
         storage::save_settings(&self.paths, &settings)?;
         Ok(user)
     }
@@ -312,10 +340,7 @@ impl OsuApiClient {
         settings.is_logged_in = false;
         settings.user_access_token = None;
         settings.user_token_expiry = None;
-        *self
-            .settings
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = settings.clone();
+        self.store_settings(settings.clone());
         *self.token.lock().await = TokenState::default();
         storage::save_settings(&self.paths, &settings)?;
         Ok(())
@@ -372,7 +397,7 @@ async fn wait_for_oauth_callback(
     listener: &TcpListener,
     expected_state: &str,
 ) -> Result<String, ApiError> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5 * 60);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -498,7 +523,7 @@ fn search_url(
     if let Some(mode) = mode_index(mode) {
         parameters.append_pair("m", mode);
     }
-    if !status.trim().is_empty() && status != "any" {
+    if !status.trim().is_empty() {
         parameters.append_pair("s", status);
     }
     if let Some(cursor) = cursor.filter(|cursor| !cursor.trim().is_empty()) {
@@ -539,9 +564,9 @@ mod tests {
     }
 
     #[test]
-    fn omits_all_mode_and_any_status() {
+    fn omits_all_mode_and_sends_any_status() {
         let url = search_url(None, "all", "any", None).unwrap();
-        assert_eq!(url.query(), Some("sort=ranked_desc"));
+        assert_eq!(url.query(), Some("sort=ranked_desc&s=any"));
     }
 
     #[test]

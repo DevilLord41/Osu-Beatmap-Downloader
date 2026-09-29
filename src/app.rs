@@ -39,7 +39,12 @@ const INFO: Color32 = Color32::from_rgb(118, 169, 250);
 const SUCCESS: Color32 = Color32::from_rgb(100, 210, 166);
 const WARNING: Color32 = Color32::from_rgb(232, 184, 92);
 const DANGER: Color32 = Color32::from_rgb(248, 113, 113);
-const RESULT_ROW_HEIGHT: f32 = 88.0;
+const RESULT_ROW_CONTENT_HEIGHT: f32 = 68.0;
+const RESULT_ROW_MARGIN: i8 = 10;
+const RESULT_ROW_STROKE: f32 = 1.0;
+// Outer row height: content + inner margin + stroke on both sides (see `Frame::total_margin`).
+const RESULT_ROW_HEIGHT: f32 =
+    RESULT_ROW_CONTENT_HEIGHT + 2.0 * (RESULT_ROW_MARGIN as f32 + RESULT_ROW_STROKE);
 const CONTROL_HEIGHT: f32 = 38.0;
 const MODE_OSU_ICON: &[u8] = include_bytes!("../OsuBmDownloader/assets/mode-osu.png");
 const MODE_TAIKO_ICON: &[u8] = include_bytes!("../OsuBmDownloader/assets/mode-taiko.png");
@@ -47,6 +52,8 @@ const MODE_CATCH_ICON: &[u8] = include_bytes!("../OsuBmDownloader/assets/mode-fr
 const MODE_MANIA_ICON: &[u8] = include_bytes!("../OsuBmDownloader/assets/mode-mania.png");
 const MAX_COVER_BYTES: usize = 10 * 1024 * 1024;
 const MAX_CACHED_COVERS: usize = 256;
+const MAX_PERSISTED_CACHES: usize = 20;
+const MAX_PERSISTED_RESULTS: usize = 500;
 
 #[derive(Clone, Copy)]
 enum Icon {
@@ -103,6 +110,10 @@ enum AppEvent {
         url: String,
         result: Result<Arc<[u8]>, String>,
     },
+    InstalledIds {
+        generation: u64,
+        ids: HashSet<i32>,
+    },
 }
 
 enum UserVerification {
@@ -131,9 +142,14 @@ pub struct BeatmapApp {
     audio_events_rx: mpsc::UnboundedReceiver<AudioEvent>,
 
     caches: HashMap<String, FilterCache>,
+    cache_recency: VecDeque<String>,
+    stale_cache_keys: HashSet<String>,
+    replace_on_next_page: bool,
     beatmaps: Vec<BeatmapSet>,
     installed_ids: HashSet<i32>,
+    installed_scan_generation: u64,
     queue: Vec<DownloadSnapshot>,
+    queue_dirty: bool,
     queue_tokens: HashMap<i32, (u64, CancellationToken)>,
     pending_queue: Vec<QueueEntry>,
     next_download_attempt: u64,
@@ -168,6 +184,7 @@ pub struct BeatmapApp {
     audio_cancellation: CancellationToken,
 
     show_settings: bool,
+    seen_settings_version: u64,
     first_run: bool,
     login_in_progress: bool,
     confirm_logout: bool,
@@ -183,11 +200,13 @@ impl BeatmapApp {
         let paths = DataPaths::discover()?;
         let settings = storage::load_settings(&paths);
         let first_run = !settings.is_configured();
-        let caches = storage::read_encrypted_json(&paths.search_cache_file)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        let installed_ids = download::installed_ids(&paths, settings.osu_songs_path().as_deref());
+        let caches: HashMap<String, FilterCache> =
+            storage::read_encrypted_json(&paths.search_cache_file)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+        let stale_cache_keys = caches.keys().cloned().collect::<HashSet<_>>();
+        let cache_recency = caches.keys().cloned().collect::<VecDeque<_>>();
         let pending_queue = download::load_queue(&paths);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -198,6 +217,9 @@ impl BeatmapApp {
         let (download_events_tx, download_events_rx) = mpsc::unbounded_channel();
         let (audio_events_tx, audio_events_rx) = mpsc::unbounded_channel();
         let api = OsuApiClient::new(settings.clone(), paths.clone())?;
+        let seen_settings_version = api.settings_version();
+        let no_video = settings.prefer_no_video;
+        let auto_install = settings.auto_install;
         let cover_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
             .user_agent(concat!(
@@ -228,9 +250,14 @@ impl BeatmapApp {
             download_events_rx,
             audio_events_rx,
             caches,
+            cache_recency,
+            stale_cache_keys,
+            replace_on_next_page: false,
             beatmaps: Vec::new(),
-            installed_ids,
+            installed_ids: HashSet::new(),
+            installed_scan_generation: 0,
             queue: Vec::new(),
+            queue_dirty: false,
             queue_tokens: HashMap::new(),
             pending_queue,
             next_download_attempt: 1,
@@ -253,20 +280,22 @@ impl BeatmapApp {
             authenticated: false,
             authenticating: false,
             authentication_generation: 0,
-            no_video: true,
-            auto_install: true,
+            no_video,
+            auto_install,
             show_downloaded: false,
             rate_limit,
             audio_player: AudioPlayer::default(),
             audio_request_id: None,
             audio_cancellation: CancellationToken::new(),
             show_settings: first_run,
+            seen_settings_version,
             first_run,
             login_in_progress: false,
             confirm_logout: false,
             error: None,
             notice: None,
         };
+        app.scan_installed_ids(&creation.egui_ctx);
         if !first_run {
             app.start_authentication(false);
         }
@@ -277,6 +306,20 @@ impl BeatmapApp {
         self.runtime
             .as_ref()
             .expect("runtime is available while the application is running")
+    }
+
+    fn scan_installed_ids(&mut self, ctx: &egui::Context) {
+        self.installed_scan_generation = self.installed_scan_generation.wrapping_add(1);
+        let generation = self.installed_scan_generation;
+        let paths = self.paths.clone();
+        let songs = self.settings.osu_songs_path();
+        let events = self.app_events_tx.clone();
+        let repaint = ctx.clone();
+        self.runtime().spawn_blocking(move || {
+            let ids = download::installed_ids(&paths, songs.as_deref());
+            let _ = events.send(AppEvent::InstalledIds { generation, ids });
+            repaint.request_repaint();
+        });
     }
 
     fn start_authentication(&mut self, replace_settings: bool) {
@@ -330,11 +373,18 @@ impl BeatmapApp {
 
     fn reset_search(&mut self) {
         if !self.authenticated {
+            if !self.authenticating && self.settings.is_configured() {
+                self.start_authentication(false);
+            }
             return;
         }
         self.search_cancellation.cancel();
         self.search_cancellation = CancellationToken::new();
         self.search_generation = self.search_generation.wrapping_add(1);
+        if self.replace_on_next_page {
+            // The fresh first page never arrived; refetch again next time this key is active.
+            self.stale_cache_keys.insert(self.active_cache_key.clone());
+        }
         self.active_query = SearchQuery::parse(&self.search_text);
         self.active_cache_key = format!(
             "{}|{}|{}",
@@ -343,9 +393,21 @@ impl BeatmapApp {
         if self.selected_status == "qualified" {
             self.caches.remove(&self.active_cache_key);
         }
-        self.caches
+        self.cache_recency
+            .retain(|key| key != &self.active_cache_key);
+        self.cache_recency.push_back(self.active_cache_key.clone());
+        let stale = self.stale_cache_keys.remove(&self.active_cache_key);
+        let cache = self
+            .caches
             .entry(self.active_cache_key.clone())
             .or_default();
+        // Rows restored from disk may be outdated: keep showing them, but refetch from page 1
+        // and replace them once the fresh page arrives.
+        self.replace_on_next_page = stale && !cache.all_results.is_empty();
+        if stale {
+            cache.cursor_string = None;
+            cache.has_more = true;
+        }
         self.loading = false;
         self.search_paused = false;
         self.refresh_visible();
@@ -459,11 +521,17 @@ impl BeatmapApp {
         if generation != self.search_generation {
             return;
         }
-        let visible_before = self.beatmaps.len();
+        let mut visible_before = self.beatmaps.len();
         let cache = self
             .caches
             .entry(self.active_cache_key.clone())
             .or_default();
+        if self.replace_on_next_page {
+            self.replace_on_next_page = false;
+            cache.all_results.clear();
+            // The stale rows are gone; judge progress against a fresh start.
+            visible_before = 0;
+        }
         let previous_cursor = cache.cursor_string.clone();
         let previous_count = cache.all_results.len();
         let mut ids = cache
@@ -503,6 +571,7 @@ impl BeatmapApp {
     fn refresh_visible(&mut self) {
         let Some(cache) = self.caches.get(&self.active_cache_key) else {
             self.beatmaps.clear();
+            self.all_downloaded_hint = false;
             return;
         };
         let queued = self
@@ -513,26 +582,31 @@ impl BeatmapApp {
                     item.status,
                     DownloadStatus::Queued
                         | DownloadStatus::Downloading
-                        | DownloadStatus::Extracting
+                        | DownloadStatus::Importing
                 )
             })
             .map(|item| item.request.beatmap_set_id)
             .collect::<HashSet<_>>();
-        self.beatmaps = cache
-            .all_results
-            .iter()
-            .filter_map(|beatmap| {
-                let mut beatmap = beatmap.clone();
-                beatmap.is_downloaded = self.installed_ids.contains(&beatmap.id);
-                beatmap.is_queued = queued.contains(&beatmap.id);
-                if beatmap.is_downloaded && !self.show_downloaded {
-                    return None;
-                }
-                self.active_query.matches(&beatmap).then_some(beatmap)
-            })
-            .collect();
+        let mode = api_mode(&self.selected_mode);
+        let mut hidden_installed = 0usize;
+        let mut beatmaps = Vec::new();
+        for set in &cache.all_results {
+            if !self.active_query.matches(set, mode) {
+                continue;
+            }
+            let is_downloaded = self.installed_ids.contains(&set.id);
+            if is_downloaded && !self.show_downloaded {
+                hidden_installed += 1;
+                continue;
+            }
+            let mut beatmap = set.clone();
+            beatmap.is_downloaded = is_downloaded;
+            beatmap.is_queued = queued.contains(&set.id);
+            beatmaps.push(beatmap);
+        }
         self.all_downloaded_hint =
-            self.beatmaps.is_empty() && !cache.all_results.is_empty() && !cache.has_more;
+            beatmaps.is_empty() && hidden_installed > 0 && !self.show_downloaded && !cache.has_more;
+        self.beatmaps = beatmaps;
     }
 
     fn enqueue_beatmap(&mut self, id: i32) {
@@ -595,7 +669,7 @@ impl BeatmapApp {
         if let Some(beatmap) = self.beatmaps.iter_mut().find(|beatmap| beatmap.id == id) {
             beatmap.is_queued = true;
         }
-        self.save_queue();
+        self.queue_dirty = true;
         true
     }
 
@@ -622,7 +696,7 @@ impl BeatmapApp {
         if let Some(beatmap) = self.beatmaps.iter_mut().find(|beatmap| beatmap.id == id) {
             beatmap.is_queued = false;
         }
-        self.save_queue();
+        self.queue_dirty = true;
     }
 
     fn cancel_all(&mut self) {
@@ -634,7 +708,7 @@ impl BeatmapApp {
         for beatmap in &mut self.beatmaps {
             beatmap.is_queued = false;
         }
-        self.save_queue();
+        self.queue_dirty = true;
     }
 
     fn download_all(&mut self) {
@@ -667,6 +741,7 @@ impl BeatmapApp {
         self.audio_cancellation.cancel();
         self.audio_cancellation = CancellationToken::new();
         self.audio_player.stop();
+        self.audio_request_id = None;
         if self.installed_ids.contains(&id)
             && let Some(path) =
                 audio::find_local_audio(self.settings.osu_songs_path().as_deref(), id)
@@ -720,7 +795,9 @@ impl BeatmapApp {
                                     tracing::warn!(%error, "could not reverify supporter account");
                                 }
                             }
-                            self.settings_draft = self.settings.clone();
+                            if !self.show_settings {
+                                self.settings_draft = self.settings.clone();
+                            }
                             self.download_service.update_settings(&self.settings);
                             self.authenticated = true;
                             for entry in std::mem::take(&mut self.pending_queue) {
@@ -728,7 +805,7 @@ impl BeatmapApp {
                                     self.pending_queue.push(entry);
                                 }
                             }
-                            self.save_queue();
+                            self.queue_dirty = true;
                             self.reset_search();
                         }
                         Err(error) => self.error = Some(error),
@@ -752,7 +829,9 @@ impl BeatmapApp {
                     match result {
                         Ok(user) => {
                             self.settings = self.api.settings();
-                            self.settings_draft = self.settings.clone();
+                            if !self.show_settings {
+                                self.settings_draft = self.settings.clone();
+                            }
                             self.download_service.update_settings(&self.settings);
                             self.notice = Some(if user.is_supporter {
                                 format!(
@@ -772,7 +851,9 @@ impl BeatmapApp {
                 AppEvent::LoggedOut(result) => match result {
                     Ok(()) => {
                         self.settings = self.api.settings();
-                        self.settings_draft = self.settings.clone();
+                        if !self.show_settings {
+                            self.settings_draft = self.settings.clone();
+                        }
                         self.download_service.update_settings(&self.settings);
                     }
                     Err(error) => self.error = Some(format!("Logout failed: {error}")),
@@ -806,6 +887,26 @@ impl BeatmapApp {
                         }
                     }
                 }
+                AppEvent::InstalledIds { generation, ids } => {
+                    if generation != self.installed_scan_generation {
+                        continue;
+                    }
+                    self.installed_ids = ids;
+                    // Keep installs that completed while the scan was running.
+                    self.installed_ids.extend(
+                        self.queue
+                            .iter()
+                            .filter(|item| item.status == DownloadStatus::Completed)
+                            .map(|item| item.request.beatmap_set_id),
+                    );
+                    self.refresh_visible();
+                    // The scan may hide every row of pages fetched before it finished.
+                    if self.beatmaps.is_empty()
+                        && cache_has_more(&self.caches, &self.active_cache_key)
+                    {
+                        self.request_page();
+                    }
+                }
             }
         }
 
@@ -820,7 +921,12 @@ impl BeatmapApp {
                         item.request.beatmap_set_id == id && item.attempt_id == attempt_id
                     }) {
                         item.status = status;
-                        self.save_queue();
+                        if !matches!(
+                            status,
+                            DownloadStatus::Downloading | DownloadStatus::Importing
+                        ) {
+                            self.queue_dirty = true;
+                        }
                     }
                 }
                 DownloadEvent::Progress {
@@ -851,9 +957,14 @@ impl BeatmapApp {
                     if self.audio_player.current_id() == Some(id) {
                         self.audio_player.stop();
                     }
+                    if self.audio_request_id == Some(id) {
+                        self.audio_cancellation.cancel();
+                        self.audio_cancellation = CancellationToken::new();
+                        self.audio_request_id = None;
+                    }
                     self.audio_service.remove_cache(id);
                     self.refresh_visible();
-                    self.save_queue();
+                    self.queue_dirty = true;
                 }
                 DownloadEvent::Failed {
                     id,
@@ -877,7 +988,7 @@ impl BeatmapApp {
                         {
                             beatmap.is_queued = false;
                         }
-                        self.save_queue();
+                        self.queue_dirty = true;
                     }
                 }
                 DownloadEvent::Cancelled { id, attempt_id }
@@ -902,7 +1013,7 @@ impl BeatmapApp {
                     {
                         beatmap.is_queued = false;
                     }
-                    self.save_queue();
+                    self.queue_dirty = true;
                 }
                 DownloadEvent::RateLimit(snapshot) => self.rate_limit = snapshot,
             }
@@ -934,10 +1045,31 @@ impl BeatmapApp {
 
     fn save_search_cache(&self) {
         let caches = self
-            .caches
+            .cache_recency
             .iter()
+            .rev()
+            .filter_map(|key| self.caches.get_key_value(key))
             .filter(|(_, cache)| cache.cursor_string.is_some() || !cache.all_results.is_empty())
-            .map(|(key, cache)| (key.clone(), cache.clone()))
+            .take(MAX_PERSISTED_CACHES)
+            .map(|(key, cache)| {
+                let truncated = cache.all_results.len() > MAX_PERSISTED_RESULTS;
+                let persisted = FilterCache {
+                    all_results: cache
+                        .all_results
+                        .iter()
+                        .take(MAX_PERSISTED_RESULTS)
+                        .cloned()
+                        .collect(),
+                    // A cursor points past the dropped rows, so a truncated cache cannot resume.
+                    cursor_string: if truncated {
+                        None
+                    } else {
+                        cache.cursor_string.clone()
+                    },
+                    has_more: cache.has_more && !truncated,
+                };
+                (key.clone(), persisted)
+            })
             .collect::<HashMap<_, _>>();
         if let Err(error) = storage::write_encrypted_json(&self.paths.search_cache_file, &caches) {
             tracing::warn!(%error, "could not save search cache");
@@ -947,6 +1079,7 @@ impl BeatmapApp {
     fn render_top_bar(&mut self, root: &mut egui::Ui) {
         let mut reset = false;
         let mut force_refresh = false;
+        let mut preferences_changed = false;
         egui::Panel::top("top_bar")
             .frame(
                 egui::Frame::new()
@@ -973,10 +1106,13 @@ impl BeatmapApp {
                     });
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if icon_button(ui, Icon::Settings, "Settings", CONTROL_HEIGHT).clicked()
-                            && !self.authenticating
-                            && !self.login_in_progress
-                        {
+                        let settings_button = ui
+                            .add_enabled_ui(!self.login_in_progress, |ui| {
+                                icon_button(ui, Icon::Settings, "Settings", CONTROL_HEIGHT)
+                            })
+                            .inner
+                            .on_disabled_hover_text("Finish the osu! login in your browser first");
+                        if settings_button.clicked() {
                             self.settings_draft = self.settings.clone();
                             self.show_settings = true;
                         }
@@ -1098,9 +1234,11 @@ impl BeatmapApp {
                     ui.add_space(4.0);
                     if toggle_chip(ui, self.no_video, "No video").clicked() {
                         self.no_video = !self.no_video;
+                        preferences_changed = true;
                     }
                     if toggle_chip(ui, self.auto_install, "Auto install").clicked() {
                         self.auto_install = !self.auto_install;
+                        preferences_changed = true;
                     }
                     if toggle_chip(ui, self.show_downloaded, "Show installed").clicked() {
                         self.show_downloaded = !self.show_downloaded;
@@ -1108,10 +1246,28 @@ impl BeatmapApp {
                     }
                 });
             });
+        if preferences_changed {
+            self.save_preferences();
+        }
         if force_refresh {
             self.force_refresh();
         } else if reset {
             self.reset_search();
+        }
+    }
+
+    fn save_preferences(&mut self) {
+        match self
+            .api
+            .update_preferences(self.no_video, self.auto_install)
+        {
+            Ok(()) => {
+                for settings in [&mut self.settings, &mut self.settings_draft] {
+                    settings.prefer_no_video = self.no_video;
+                    settings.auto_install = self.auto_install;
+                }
+            }
+            Err(error) => self.error = Some(format!("Could not save preferences: {error}")),
         }
     }
 
@@ -1142,7 +1298,7 @@ impl BeatmapApp {
                         );
                         ui.label(
                             RichText::new(format!(
-                                "{} in this session",
+                                "{} in queue",
                                 self.queue.len() + self.pending_queue.len()
                             ))
                             .size(12.0)
@@ -1164,11 +1320,13 @@ impl BeatmapApp {
                 });
 
                 ui.add_space(12.0);
-                let (rate_color, rate_background) = if self.rate_limit.cooldown_seconds > 0 {
-                    (WARNING, Color32::from_rgb(47, 37, 23))
-                } else {
-                    (SUCCESS, Color32::from_rgb(24, 43, 36))
-                };
+                let exhausted = !self.rate_limit.unlimited && self.rate_limit.remaining == 0;
+                let (rate_color, rate_background) =
+                    if self.rate_limit.cooldown_seconds > 0 || exhausted {
+                        (WARNING, Color32::from_rgb(47, 37, 23))
+                    } else {
+                        (SUCCESS, Color32::from_rgb(24, 43, 36))
+                    };
                 info_strip(ui, &self.rate_limit.text(), rate_color, rate_background);
                 if !self.pending_queue.is_empty() {
                     ui.add_space(8.0);
@@ -1392,6 +1550,10 @@ impl BeatmapApp {
                         "Everything is installed",
                         "Enable Show installed or adjust the current filters.",
                     );
+                } else if self.beatmaps.is_empty() && !self.authenticated && !self.authenticating
+                {
+                    ui.add_space(72.0);
+                    empty_state(ui, Icon::Alert, "Not connected", "Press Refresh to retry.");
                 } else if self.beatmaps.is_empty() && self.authenticated {
                     ui.add_space(72.0);
                     empty_state(
@@ -1411,16 +1573,29 @@ impl BeatmapApp {
                             for index in rows {
                                 let beatmap = &self.beatmaps[index];
                                 let id = beatmap.id;
+                                // Allocate exactly one row so `show_rows` spacing stays in sync
+                                // with the real layout even if content would overflow.
+                                let (_, row_rect) = ui.allocate_space(Vec2::new(
+                                    ui.available_width(),
+                                    RESULT_ROW_HEIGHT,
+                                ));
+                                let mut row_ui = ui.new_child(
+                                    egui::UiBuilder::new()
+                                        .max_rect(row_rect)
+                                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                                );
+                                row_ui.shrink_clip_rect(row_rect);
                                 egui::Frame::new()
                                     .fill(SURFACE)
-                                    .stroke(Stroke::new(1.0, BORDER))
+                                    .stroke(Stroke::new(RESULT_ROW_STROKE, BORDER))
                                     .corner_radius(12)
-                                    .inner_margin(egui::Margin::symmetric(10, 10))
-                                    .show(ui, |ui| {
-                                        ui.set_min_height(68.0);
+                                    .inner_margin(egui::Margin::same(RESULT_ROW_MARGIN))
+                                    .show(&mut row_ui, |ui| {
+                                        ui.set_height(RESULT_ROW_CONTENT_HEIGHT);
                                         ui.set_min_width(ui.available_width());
                                         ui.horizontal(|ui| {
-                                            let cover_size = Vec2::new(106.0, 68.0);
+                                            let cover_size =
+                                                Vec2::new(106.0, RESULT_ROW_CONTENT_HEIGHT);
                                             if let Some(url) = beatmap.cover_url() {
                                                 if let Some(cover) = self
                                                     .cover_images
@@ -1503,10 +1678,14 @@ impl BeatmapApp {
                                             let info_width =
                                                 (ui.available_width() - 56.0).max(120.0);
                                             ui.allocate_ui_with_layout(
-                                                Vec2::new(info_width, 68.0),
+                                                Vec2::new(info_width, RESULT_ROW_CONTENT_HEIGHT),
                                                 egui::Layout::top_down(egui::Align::Min),
                                                 |ui| {
-                                                    ui.set_min_size(Vec2::new(info_width, 68.0));
+                                                    ui.set_min_size(Vec2::new(
+                                                        info_width,
+                                                        RESULT_ROW_CONTENT_HEIGHT,
+                                                    ));
+                                                    ui.spacing_mut().item_spacing.y = 4.0;
                                                     let title_response = ui
                                                         .add(
                                                             egui::Label::new(
@@ -1538,25 +1717,31 @@ impl BeatmapApp {
                                                         .truncate(),
                                                     )
                                                     .on_hover_text(attribution);
-                                                    ui.add_space(5.0);
-                                                    ui.horizontal(|ui| {
-                                                        let color = status_color(&beatmap.status);
-                                                        badge(
-                                                            ui,
-                                                            status_label(&beatmap.status),
-                                                            color,
-                                                            status_background(&beatmap.status),
-                                                        );
-                                                        let date = beatmap.date_text();
-                                                        if !date.is_empty() {
-                                                            meta_label(ui, &date);
-                                                        }
-                                                        let stars = beatmap.star_range_text();
-                                                        let stars = stars
-                                                            .strip_prefix("\u{2605} ")
-                                                            .unwrap_or(&stars);
-                                                        meta_label(ui, &format!("{stars} SR"));
-                                                    });
+                                                    ui.add_space(2.0);
+                                                    ui.allocate_ui_with_layout(
+                                                        Vec2::new(ui.available_width(), 22.0),
+                                                        egui::Layout::left_to_right(
+                                                            egui::Align::Center,
+                                                        ),
+                                                        |ui| {
+                                                            let color = status_color(&beatmap.status);
+                                                            badge(
+                                                                ui,
+                                                                status_label(&beatmap.status),
+                                                                color,
+                                                                status_background(&beatmap.status),
+                                                            );
+                                                            let date = beatmap.date_text();
+                                                            if !date.is_empty() {
+                                                                meta_label(ui, &date);
+                                                            }
+                                                            let stars = beatmap.star_range_text();
+                                                            let stars = stars
+                                                                .strip_prefix("\u{2605} ")
+                                                                .unwrap_or(&stars);
+                                                            meta_label(ui, &format!("{stars} SR"));
+                                                        },
+                                                    );
                                                 },
                                             );
 
@@ -1721,16 +1906,36 @@ impl BeatmapApp {
         if save {
             self.settings_draft.client_id = self.settings_draft.client_id.trim().to_owned();
             self.settings_draft.client_secret = self.settings_draft.client_secret.trim().to_owned();
-            self.settings_draft.osu_path = self.settings_draft.osu_path.trim().to_owned();
-            if !self.settings_draft.is_configured() {
+            self.settings_draft.osu_path = self
+                .settings_draft
+                .osu_path
+                .trim()
+                .trim_matches('"')
+                .trim()
+                .to_owned();
+            // Only the fields edited in this modal come from the draft; everything else (tokens,
+            // account state, preferences) may have changed while the modal was open.
+            let mut settings = self.settings.clone();
+            settings.client_id = self.settings_draft.client_id.clone();
+            settings.client_secret = self.settings_draft.client_secret.clone();
+            settings.osu_path = self.settings_draft.osu_path.clone();
+            let songs_missing = settings
+                .osu_songs_path()
+                .is_some_and(|songs| !songs.is_dir());
+            if !settings.is_configured() {
                 self.error = Some("Client ID and Client Secret are required.".to_owned());
-            } else if let Err(error) = storage::save_settings(&self.paths, &self.settings_draft) {
+            } else if songs_missing {
+                self.error = Some(format!(
+                    "No Songs folder was found in \"{}\". Select your osu! installation folder.",
+                    settings.osu_path
+                ));
+            } else if let Err(error) = storage::save_settings(&self.paths, &settings) {
                 self.error = Some(format!("Could not save settings: {error}"));
             } else {
-                self.settings = self.settings_draft.clone();
+                self.settings_draft = settings.clone();
+                self.settings = settings;
                 self.download_service.update_settings(&self.settings);
-                self.installed_ids =
-                    download::installed_ids(&self.paths, self.settings.osu_songs_path().as_deref());
+                self.scan_installed_ids(ctx);
                 self.show_settings = false;
                 self.first_run = false;
                 self.start_authentication(true);
@@ -1830,20 +2035,19 @@ impl eframe::App for BeatmapApp {
         {
             self.error = Some(format!("Could not save expired account state: {error}"));
         }
-        let api_settings = self.api.settings();
-        if api_settings.is_supporter != self.settings.is_supporter
-            || api_settings.is_logged_in != self.settings.is_logged_in
-            || api_settings.user_access_token != self.settings.user_access_token
-            || api_settings.username != self.settings.username
-            || api_settings.support_level != self.settings.support_level
-        {
-            self.settings = api_settings;
-            self.settings_draft = self.settings.clone();
+        let settings_version = self.api.settings_version();
+        if settings_version != self.seen_settings_version {
+            self.seen_settings_version = settings_version;
+            self.settings = self.api.settings();
+            if !self.show_settings {
+                self.settings_draft = self.settings.clone();
+            }
             self.download_service.update_settings(&self.settings);
         }
         self.rate_limit = self.download_service.rate_limit();
         self.audio_player.reconcile();
-        while self.authenticated
+        // Downloads go through mirrors, so they only need configured settings, not osu! API auth.
+        while self.settings.is_configured()
             && !self.pending_queue.is_empty()
             && (self.rate_limit.unlimited || self.rate_limit.remaining > 0)
         {
@@ -1865,7 +2069,7 @@ impl eframe::App for BeatmapApp {
         let has_active_downloads = self.queue.iter().any(|item| {
             matches!(
                 item.status,
-                DownloadStatus::Queued | DownloadStatus::Downloading | DownloadStatus::Extracting
+                DownloadStatus::Queued | DownloadStatus::Downloading | DownloadStatus::Importing
             )
         });
         let active = self.loading
@@ -1879,6 +2083,10 @@ impl eframe::App for BeatmapApp {
         } else {
             Duration::from_secs(1)
         });
+        if self.queue_dirty {
+            self.queue_dirty = false;
+            self.save_queue();
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -2703,6 +2911,15 @@ fn system_animations_enabled() -> bool {
     result.is_err() || enabled != 0
 }
 
+/// Maps the UI mode filter to the osu! API mode name used on individual difficulties.
+fn api_mode(mode: &str) -> Option<&str> {
+    match mode {
+        "all" => None,
+        "catch" => Some("fruits"),
+        mode => Some(mode),
+    }
+}
+
 fn mode_label(mode: &str) -> &str {
     match mode {
         "osu" => "osu!",
@@ -2716,9 +2933,11 @@ fn mode_label(mode: &str) -> &str {
 fn status_label(status: &str) -> &str {
     match status {
         "ranked" => "Ranked",
+        "approved" => "Approved",
         "qualified" => "Qualified",
         "loved" => "Loved",
         "pending" => "Pending",
+        "wip" => "WIP",
         "graveyard" => "Graveyard",
         "any" => "Any status",
         _ => status,
@@ -2727,10 +2946,10 @@ fn status_label(status: &str) -> &str {
 
 fn status_color(status: &str) -> Color32 {
     match status {
-        "ranked" => SUCCESS,
+        "ranked" | "approved" => SUCCESS,
         "qualified" => Color32::from_rgb(197, 216, 109),
         "loved" => ACCENT_HOVER,
-        "pending" => WARNING,
+        "pending" | "wip" => WARNING,
         "graveyard" => TEXT_MUTED,
         _ => TEXT_SECONDARY,
     }
@@ -2738,10 +2957,10 @@ fn status_color(status: &str) -> Color32 {
 
 fn status_background(status: &str) -> Color32 {
     match status {
-        "ranked" => Color32::from_rgb(23, 45, 37),
+        "ranked" | "approved" => Color32::from_rgb(23, 45, 37),
         "qualified" => Color32::from_rgb(42, 45, 25),
         "loved" => ACCENT_MUTED,
-        "pending" => Color32::from_rgb(47, 37, 23),
+        "pending" | "wip" => Color32::from_rgb(47, 37, 23),
         "graveyard" => SURFACE_RAISED,
         _ => SURFACE_RAISED,
     }
@@ -2751,7 +2970,7 @@ fn download_status_color(status: DownloadStatus) -> Color32 {
     match status {
         DownloadStatus::Queued => TEXT_SECONDARY,
         DownloadStatus::Downloading => INFO,
-        DownloadStatus::Extracting => WARNING,
+        DownloadStatus::Importing => WARNING,
         DownloadStatus::Completed => SUCCESS,
         DownloadStatus::Failed => DANGER,
     }

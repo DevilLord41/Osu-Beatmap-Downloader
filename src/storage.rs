@@ -58,13 +58,18 @@ pub fn write_encrypted(path: &Path, value: &str) -> Result<()> {
         std::process::id(),
         rand::random::<u64>()
     ));
-    {
+    let written = (|| -> Result<()> {
         let mut file = File::create(&temporary)
             .with_context(|| format!("create temporary encrypted file {}", temporary.display()))?;
         file.write_all(&encrypted)
             .with_context(|| format!("write temporary encrypted file {}", temporary.display()))?;
         file.sync_all()
             .with_context(|| format!("flush temporary encrypted file {}", temporary.display()))?;
+        Ok(())
+    })();
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
     }
     let source = wide_path(&temporary);
     let destination = wide_path(path);

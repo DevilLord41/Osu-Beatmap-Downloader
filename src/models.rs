@@ -8,6 +8,7 @@ pub struct AppSettings {
     pub client_secret: String,
     pub osu_path: String,
     pub prefer_no_video: bool,
+    pub auto_install: bool,
     pub username: String,
     pub is_supporter: bool,
     pub support_level: i32,
@@ -24,6 +25,7 @@ impl Default for AppSettings {
             client_secret: String::new(),
             osu_path: String::new(),
             prefer_no_video: true,
+            auto_install: true,
             username: String::new(),
             is_supporter: false,
             support_level: 0,
@@ -54,6 +56,11 @@ impl AppSettings {
         } else {
             Some(root.join("Songs"))
         }
+    }
+
+    pub fn osu_executable_path(&self) -> Option<std::path::PathBuf> {
+        let songs = self.osu_songs_path()?;
+        Some(songs.parent()?.join("osu!.exe"))
     }
 }
 
@@ -242,6 +249,20 @@ mod tests {
         assert!(settings.is_configured());
         assert_eq!(settings.user_token_expiry, None);
         assert!(settings.osu_songs_path().unwrap().ends_with("Songs"));
+    }
+
+    #[test]
+    fn osu_executable_resolves_from_install_or_songs_folder() {
+        let mut settings = AppSettings {
+            osu_path: r"C:\osu!".to_owned(),
+            ..AppSettings::default()
+        };
+        let expected = std::path::Path::new(r"C:\osu!").join("osu!.exe");
+        assert_eq!(settings.osu_executable_path().unwrap(), expected);
+        settings.osu_path = r"C:\osu!\Songs".to_owned();
+        assert_eq!(settings.osu_executable_path().unwrap(), expected);
+        settings.osu_path = "  ".to_owned();
+        assert_eq!(settings.osu_executable_path(), None);
     }
 
     #[test]

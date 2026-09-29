@@ -43,11 +43,13 @@ impl SearchQuery {
         Self { text, filters }
     }
 
-    pub fn matches(&self, beatmap_set: &BeatmapSet) -> bool {
+    /// `mode` is an osu! API mode name; when set, only difficulties of that mode are considered.
+    pub fn matches(&self, beatmap_set: &BeatmapSet, mode: Option<&str>) -> bool {
         self.filters.is_empty()
             || beatmap_set
                 .beatmaps
                 .iter()
+                .filter(|beatmap| mode.is_none_or(|mode| beatmap.mode == mode))
                 .any(|beatmap| self.filters.iter().all(|filter| filter.matches(beatmap)))
     }
 }
@@ -79,7 +81,7 @@ impl SearchFilter {
 fn filter_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
-        Regex::new(r"(?i)(star|bpm|length|ar|cs|od|hp)\s*(>=|<=|>|<|=)\s*(\d+(?:\.\d+)?)")
+        Regex::new(r"(?i)\b(star|bpm|length|ar|cs|od|hp)\s*(>=|<=|>|<|=)\s*([0-9]+(?:\.[0-9]+)?)")
             .expect("search filter regex is valid")
     })
 }
@@ -115,14 +117,14 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert!(!query.matches(&set));
+        assert!(!query.matches(&set, None));
 
         set.beatmaps.push(Beatmap {
             difficulty_rating: 6.0,
             ar: 9.5,
             ..Default::default()
         });
-        assert!(query.matches(&set));
+        assert!(query.matches(&set, None));
     }
 
     #[test]
@@ -135,6 +137,33 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(query.matches(&set));
+        assert!(query.matches(&set, None));
+    }
+
+    #[test]
+    fn filters_need_word_boundary_and_respect_mode() {
+        let query = SearchQuery::parse("Teddy Bear <3");
+        assert!(query.filters.is_empty());
+        assert_eq!(query.text, "Teddy Bear <3");
+
+        let query = SearchQuery::parse("star>=6");
+        let set = BeatmapSet {
+            beatmaps: vec![
+                Beatmap {
+                    mode: "osu".to_owned(),
+                    difficulty_rating: 6.0,
+                    ..Default::default()
+                },
+                Beatmap {
+                    mode: "taiko".to_owned(),
+                    difficulty_rating: 3.0,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(query.matches(&set, None));
+        assert!(query.matches(&set, Some("osu")));
+        assert!(!query.matches(&set, Some("taiko")));
     }
 }

@@ -1,8 +1,7 @@
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError};
 use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
@@ -22,15 +21,13 @@ use crate::storage;
 
 const RATE_LIMIT_COUNT: usize = 30;
 const RATE_LIMIT_HOURS: i64 = 1;
-const MAX_ARCHIVE_ENTRIES: usize = 10_000;
 const MAX_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-const MAX_UNCOMPRESSED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DownloadStatus {
     Queued,
     Downloading,
-    Extracting,
+    Importing,
     Completed,
     Failed,
 }
@@ -40,7 +37,7 @@ impl DownloadStatus {
         match self {
             Self::Queued => "queued".to_owned(),
             Self::Downloading => format!("{progress:.0}%"),
-            Self::Extracting => "extracting...".to_owned(),
+            Self::Importing => "importing...".to_owned(),
             Self::Completed => "done".to_owned(),
             Self::Failed => "failed".to_owned(),
         }
@@ -133,16 +130,14 @@ pub enum DownloadError {
     Timeout,
     #[error("server returned HTTP {0}")]
     Http(StatusCode),
-    #[error("downloaded file is not a valid .osz archive")]
-    InvalidArchive,
     #[error("downloaded archive exceeds the 2 GiB safety limit")]
     ArchiveTooLarge,
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("network error: {0}")]
     Network(#[from] reqwest::Error),
-    #[error("archive error: {0}")]
-    Archive(#[from] zip::result::ZipError),
+    #[error("could not open the archive in osu!: {0}")]
+    OsuLaunch(std::io::Error),
     #[error("background task failed: {0}")]
     Task(#[from] tokio::task::JoinError),
 }
@@ -199,6 +194,7 @@ struct RateLimiter {
     reservations: usize,
     path: PathBuf,
     dirty: bool,
+    revision: u64,
     last_persist_attempt: Option<std::time::Instant>,
 }
 
@@ -223,6 +219,7 @@ impl RateLimiter {
             reservations: 0,
             path,
             dirty: false,
+            revision: 0,
             last_persist_attempt: None,
         };
         limiter.prune();
@@ -261,27 +258,28 @@ impl RateLimiter {
         }
     }
 
-    fn commit(&mut self, reservation: RateReservation) -> anyhow::Result<()> {
+    /// Records a completed download. Returns whether the timestamps changed and need persisting.
+    fn commit(&mut self, reservation: RateReservation) -> bool {
         if !reservation.counted {
-            return Ok(());
+            return false;
         }
         self.reservations = self.reservations.saturating_sub(1);
         self.timestamps.push(Utc::now());
         self.timestamps.sort_unstable();
         self.dirty = true;
-        self.persist()
+        self.revision += 1;
+        true
+    }
+
+    fn needs_persist_retry(&self) -> bool {
+        self.dirty
+            && self
+                .last_persist_attempt
+                .is_none_or(|attempt| attempt.elapsed() >= Duration::from_secs(5))
     }
 
     fn snapshot(&mut self) -> RateLimitSnapshot {
         self.prune();
-        if self.dirty
-            && self
-                .last_persist_attempt
-                .is_none_or(|attempt| attempt.elapsed() >= Duration::from_secs(5))
-            && let Err(error) = self.persist()
-        {
-            tracing::warn!(%error, "could not retry download rate-limit persistence");
-        }
         if self.supporter {
             return RateLimitSnapshot {
                 unlimited: true,
@@ -316,11 +314,19 @@ impl RateLimiter {
         self.timestamps.sort_unstable();
     }
 
-    fn persist(&mut self) -> anyhow::Result<()> {
+    /// Returns the data to write when unsaved changes exist; the write happens outside the lock.
+    fn persist_payload(&mut self) -> Option<(PathBuf, Vec<DateTime<Utc>>, u64)> {
+        if !self.dirty {
+            return None;
+        }
         self.last_persist_attempt = Some(std::time::Instant::now());
-        storage::write_encrypted_json(&self.path, &self.timestamps)?;
-        self.dirty = false;
-        Ok(())
+        Some((self.path.clone(), self.timestamps.clone(), self.revision))
+    }
+
+    fn persisted(&mut self, revision: u64) {
+        if self.revision == revision {
+            self.dirty = false;
+        }
     }
 }
 
@@ -328,9 +334,10 @@ impl RateLimiter {
 pub struct DownloadService {
     client: Client,
     paths: DataPaths,
-    osu_songs_path: Arc<RwLock<Option<PathBuf>>>,
+    osu_executable: Arc<RwLock<Option<PathBuf>>>,
     semaphore: Arc<Semaphore>,
     rate_limiter: Arc<Mutex<RateLimiter>>,
+    rate_limit_persist: Arc<Mutex<()>>,
     events: mpsc::UnboundedSender<DownloadEvent>,
 }
 
@@ -340,52 +347,47 @@ impl DownloadService {
         settings: &AppSettings,
         events: mpsc::UnboundedSender<DownloadEvent>,
     ) -> Result<Self, reqwest::Error> {
-        if let Some(songs_path) = settings.osu_songs_path().filter(|path| path.is_dir())
-            && let Err(error) = recover_install_artifacts(&songs_path)
-        {
-            tracing::warn!(%error, "could not recover interrupted beatmap installation");
-        }
         let client = Client::builder()
-            .timeout(Duration::from_secs(10 * 60))
+            .connect_timeout(Duration::from_secs(30))
+            .read_timeout(Duration::from_secs(30))
             .user_agent(concat!(
                 "OsuBmDownloader/",
                 env!("CARGO_PKG_VERSION"),
                 "-rust"
             ))
             .build()?;
+        sweep_partial_downloads(&paths.temp_songs_dir);
         let limiter = RateLimiter::load(settings.is_supporter, paths.rate_limit_file.clone());
         Ok(Self {
             client,
             paths,
-            osu_songs_path: Arc::new(RwLock::new(settings.osu_songs_path())),
+            osu_executable: Arc::new(RwLock::new(settings.osu_executable_path())),
             semaphore: Arc::new(Semaphore::new(2)),
             rate_limiter: Arc::new(Mutex::new(limiter)),
+            rate_limit_persist: Arc::new(Mutex::new(())),
             events,
         })
     }
 
     pub fn update_settings(&self, settings: &AppSettings) {
-        if let Some(songs_path) = settings.osu_songs_path().filter(|path| path.is_dir())
-            && let Err(error) = recover_install_artifacts(&songs_path)
-        {
-            tracing::warn!(%error, "could not recover interrupted beatmap installation");
-        }
         *self
-            .osu_songs_path
+            .osu_executable
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = settings.osu_songs_path();
-        self.rate_limiter
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = settings.osu_executable_path();
+        self.lock_rate_limiter()
             .set_supporter(settings.is_supporter);
         self.emit_rate_limit();
     }
 
     pub fn rate_limit(&self) -> RateLimitSnapshot {
-        self.rate_limiter
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .snapshot()
+        let (snapshot, retry_persist) = {
+            let mut limiter = self.lock_rate_limiter();
+            (limiter.snapshot(), limiter.needs_persist_retry())
+        };
+        if retry_persist && let Err(error) = self.persist_rate_limit(false) {
+            tracing::warn!(%error, "could not retry download rate-limit persistence");
+        }
+        snapshot
     }
 
     pub fn spawn(
@@ -395,11 +397,7 @@ impl DownloadService {
         request: DownloadRequest,
         cancellation: CancellationToken,
     ) -> Result<(), RateLimitSnapshot> {
-        let reservation = self
-            .rate_limiter
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .reserve();
+        let reservation = self.lock_rate_limiter().reserve();
         let Some(reservation) = reservation else {
             return Err(self.rate_limit());
         };
@@ -430,7 +428,7 @@ impl DownloadService {
             }
             permit = Arc::clone(&self.semaphore).acquire_owned() => permit,
         };
-        let Ok(_permit) = permit else {
+        let Ok(permit) = permit else {
             self.release_reservation(reservation.take().expect("reservation is present"));
             return;
         };
@@ -453,6 +451,7 @@ impl DownloadService {
                 let _ = self
                     .events
                     .send(DownloadEvent::Completed { id, attempt_id });
+                drop(permit);
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 let _ = self.events.send(DownloadEvent::Removed { id, attempt_id });
             }
@@ -496,13 +495,13 @@ impl DownloadService {
         if archive_path.exists() && !is_valid_zip(&archive_path) {
             std::fs::remove_file(&archive_path)?;
         }
+        let mut downloaded = false;
         if !archive_path.exists() {
             let _ = self.events.send(DownloadEvent::Status {
                 id: request.beatmap_set_id,
                 attempt_id,
                 status: DownloadStatus::Downloading,
             });
-            let mut downloaded = false;
             for url in mirror_urls(request.beatmap_set_id, request.no_video) {
                 if cancellation.is_cancelled() {
                     let _ = tokio::fs::remove_file(&partial_path).await;
@@ -523,7 +522,10 @@ impl DownloadService {
                         if archive_path.exists() {
                             let _ = tokio::fs::remove_file(&archive_path).await;
                         }
-                        tokio::fs::rename(&partial_path, &archive_path).await?;
+                        if let Err(error) = tokio::fs::rename(&partial_path, &archive_path).await {
+                            let _ = tokio::fs::remove_file(&partial_path).await;
+                            return Err(error.into());
+                        }
                         downloaded = true;
                         break;
                     }
@@ -532,8 +534,10 @@ impl DownloadService {
                     | Err(DownloadError::Http(_))
                     | Err(DownloadError::ArchiveTooLarge)
                     | Err(DownloadError::Network(_)) => {}
-                    Err(DownloadError::Cancelled) => return Err(DownloadError::Cancelled),
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        let _ = tokio::fs::remove_file(&partial_path).await;
+                        return Err(error);
+                    }
                 }
             }
             let _ = tokio::fs::remove_file(&partial_path).await;
@@ -542,32 +546,29 @@ impl DownloadService {
             }
         }
 
-        self.commit_reservation(
-            reservation
-                .take()
-                .expect("reservation is committed exactly once"),
-        );
+        let reservation = reservation
+            .take()
+            .expect("reservation is settled exactly once");
+        if downloaded {
+            self.commit_reservation(reservation);
+        } else {
+            // A cached archive was reused; no mirror download consumed a rate-limit slot.
+            self.release_reservation(reservation);
+        }
 
         if request.auto_install {
-            let _ = self.events.send(DownloadEvent::Status {
-                id: request.beatmap_set_id,
-                attempt_id,
-                status: DownloadStatus::Extracting,
-            });
-            let songs_path = self
-                .osu_songs_path
+            let executable = self
+                .osu_executable
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
-            if let Some(songs_path) = songs_path.filter(|path| path.is_dir()) {
-                let archive = archive_path.clone();
-                let request = request.clone();
-                let cancellation = cancellation.clone();
-                tokio::task::spawn_blocking(move || {
-                    extract_archive(&archive, &songs_path, &request, &cancellation)
-                })
-                .await??;
-                let _ = tokio::fs::remove_file(&archive_path).await;
+            if let Some(executable) = executable {
+                let _ = self.events.send(DownloadEvent::Status {
+                    id: request.beatmap_set_id,
+                    attempt_id,
+                    status: DownloadStatus::Importing,
+                });
+                open_in_osu(&executable, &archive_path)?;
             }
         }
         Ok(())
@@ -637,22 +638,43 @@ impl DownloadService {
     }
 
     fn release_reservation(&self, reservation: RateReservation) {
-        self.rate_limiter
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .release(reservation);
+        self.lock_rate_limiter().release(reservation);
     }
 
     fn commit_reservation(&self, reservation: RateReservation) {
-        if let Err(error) = self
-            .rate_limiter
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .commit(reservation)
-        {
+        let changed = self.lock_rate_limiter().commit(reservation);
+        if changed && let Err(error) = self.persist_rate_limit(true) {
             tracing::error!(%error, "could not persist download rate limit");
         }
         self.emit_rate_limit();
+    }
+
+    /// Writes the rate-limit timestamps without holding the limiter lock during file I/O.
+    /// Writers are serialized so an older snapshot never overwrites a newer one on disk.
+    fn persist_rate_limit(&self, wait: bool) -> anyhow::Result<()> {
+        let _guard = if wait {
+            self.rate_limit_persist
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        } else {
+            match self.rate_limit_persist.try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(TryLockError::WouldBlock) => return Ok(()),
+            }
+        };
+        let Some((path, timestamps, revision)) = self.lock_rate_limiter().persist_payload() else {
+            return Ok(());
+        };
+        storage::write_encrypted_json(&path, &timestamps)?;
+        self.lock_rate_limiter().persisted(revision);
+        Ok(())
+    }
+
+    fn lock_rate_limiter(&self) -> MutexGuard<'_, RateLimiter> {
+        self.rate_limiter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn emit_rate_limit(&self) {
@@ -694,42 +716,62 @@ pub fn save_queue(
 
 pub fn installed_ids(paths: &DataPaths, osu_songs_path: Option<&Path>) -> HashSet<i32> {
     let mut ids = HashSet::new();
-    if let Some(songs_path) = osu_songs_path.filter(|path| path.is_dir())
+    if let Some(songs_path) = osu_songs_path
         && let Ok(entries) = std::fs::read_dir(songs_path)
     {
         for entry in entries.flatten() {
-            let path = entry.path();
-            let has_file = path.read_dir().ok().is_some_and(|entries| {
-                entries.flatten().any(|entry| {
-                    let path = entry.path();
-                    path.is_file()
-                        && path
-                            .extension()
-                            .is_some_and(|extension| extension.eq_ignore_ascii_case("osu"))
-                })
-            });
-            if !path.is_dir() || !has_file {
+            let Some(id) = id_from_file_name(&entry.file_name().to_string_lossy()) else {
+                continue;
+            };
+            if ids.contains(&id) || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
                 continue;
             }
-            if let Some(id) = id_from_file_name(&entry.file_name().to_string_lossy()) {
+            let has_file = std::fs::read_dir(entry.path()).is_ok_and(|children| {
+                children.flatten().any(|child| {
+                    Path::new(&child.file_name())
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("osu"))
+                        && child.file_type().is_ok_and(|kind| kind.is_file())
+                })
+            });
+            if has_file {
                 ids.insert(id);
             }
         }
     }
     if let Ok(entries) = std::fs::read_dir(&paths.temp_songs_dir) {
         for entry in entries.flatten() {
-            let path = entry.path();
-            if path
+            let name = entry.file_name();
+            if Path::new(&name)
                 .extension()
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("osz"))
-                && is_valid_zip(&path)
-                && let Some(id) = id_from_file_name(&entry.file_name().to_string_lossy())
+                && let Some(id) = id_from_file_name(&name.to_string_lossy())
             {
                 ids.insert(id);
             }
         }
     }
     ids
+}
+
+fn sweep_partial_downloads(directory: &Path) {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(%error, directory = %directory.display(), "could not scan for partial downloads");
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("part"))
+            && let Err(error) = std::fs::remove_file(&path)
+        {
+            tracing::warn!(%error, path = %path.display(), "could not remove partial download");
+        }
+    }
 }
 
 fn id_from_file_name(name: &str) -> Option<i32> {
@@ -755,10 +797,11 @@ fn mirror_urls(id: i32, no_video: bool) -> [String; 3] {
 
 fn archive_name(request: &DownloadRequest) -> String {
     format!(
-        "{} {} - {}.osz",
+        "{} {} - {}{}.osz",
         request.beatmap_set_id,
         sanitize_file_name(&request.artist),
-        sanitize_file_name(&request.title)
+        sanitize_file_name(&request.title),
+        if request.no_video { " [no video]" } else { "" }
     )
 }
 
@@ -799,150 +842,26 @@ fn is_valid_zip(path: &Path) -> bool {
         .is_some_and(|archive| !archive.is_empty())
 }
 
-fn extract_archive(
-    archive_path: &Path,
-    songs_path: &Path,
-    request: &DownloadRequest,
-    cancellation: &CancellationToken,
-) -> Result<(), DownloadError> {
-    let folder_name = format!(
-        "{} {} - {}",
-        request.beatmap_set_id,
-        sanitize_file_name(&request.artist),
-        sanitize_file_name(&request.title)
-    );
-    let target = songs_path.join(&folder_name);
-    let nonce = rand::random::<u64>();
-    let staging = songs_path.join(format!(".{folder_name}.{nonce}.installing"));
-    let backup = songs_path.join(format!(".{folder_name}.{nonce}.backup"));
-    std::fs::create_dir(&staging)?;
-
-    let extraction = (|| -> Result<(), DownloadError> {
-        let file = File::open(archive_path)?;
-        let mut archive = ZipArchive::new(file)?;
-        if archive.is_empty() || archive.len() > MAX_ARCHIVE_ENTRIES {
-            return Err(DownloadError::InvalidArchive);
-        }
-        let mut uncompressed_bytes = 0_u64;
-        for index in 0..archive.len() {
-            if cancellation.is_cancelled() {
-                return Err(DownloadError::Cancelled);
-            }
-            let mut entry = archive.by_index(index)?;
-            let Some(relative) = entry.enclosed_name() else {
-                return Err(DownloadError::InvalidArchive);
-            };
-            if entry
-                .unix_mode()
-                .is_some_and(|mode| mode & 0o170000 == 0o120000)
-                || relative
-                    .components()
-                    .any(|component| component.as_os_str().to_string_lossy().contains(':'))
-            {
-                return Err(DownloadError::InvalidArchive);
-            }
-            uncompressed_bytes = uncompressed_bytes
-                .checked_add(entry.size())
-                .filter(|total| *total <= MAX_UNCOMPRESSED_BYTES)
-                .ok_or(DownloadError::InvalidArchive)?;
-            let output = staging.join(relative);
-            if entry.is_dir() {
-                std::fs::create_dir_all(&output)?;
-                continue;
-            }
-            if let Some(parent) = output.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let mut output_file = File::create(&output)?;
-            let mut buffer = [0_u8; 64 * 1024];
-            loop {
-                if cancellation.is_cancelled() {
-                    return Err(DownloadError::Cancelled);
-                }
-                let read = entry.read(&mut buffer)?;
-                if read == 0 {
-                    break;
-                }
-                output_file.write_all(&buffer[..read])?;
-            }
-        }
-        Ok(())
-    })();
-    if let Err(error) = extraction {
-        let _ = std::fs::remove_dir_all(&staging);
-        return Err(error);
+/// Hands the archive to osu!, which imports it itself (or forwards it to an already running instance).
+/// When osu!.exe is not next to the Songs folder (e.g. a relocated Songs directory), the archive is
+/// opened through its Windows file association instead.
+fn open_in_osu(executable: &Path, archive_path: &Path) -> Result<(), DownloadError> {
+    let archive_path = std::path::absolute(archive_path)?;
+    if !executable.is_file() {
+        return open::that(&archive_path).map_err(DownloadError::OsuLaunch);
     }
-    if cancellation.is_cancelled() {
-        let _ = std::fs::remove_dir_all(&staging);
-        return Err(DownloadError::Cancelled);
+    let mut command = std::process::Command::new(executable);
+    command.arg(archive_path);
+    if let Some(directory) = executable.parent() {
+        command.current_dir(directory);
     }
-
-    if target.exists()
-        && let Err(error) = std::fs::rename(&target, &backup)
-    {
-        let _ = std::fs::remove_dir_all(&staging);
-        return Err(DownloadError::Io(error));
-    }
-    if let Err(error) = std::fs::rename(&staging, &target) {
-        if backup.exists()
-            && let Err(restore_error) = std::fs::rename(&backup, &target)
-        {
-            return Err(DownloadError::Io(std::io::Error::other(format!(
-                "install failed ({error}) and restoring {} failed ({restore_error})",
-                backup.display()
-            ))));
-        }
-        let _ = std::fs::remove_dir_all(&staging);
-        return Err(DownloadError::Io(error));
-    }
-    if backup.exists()
-        && let Err(error) = std::fs::remove_dir_all(&backup)
-    {
-        tracing::warn!(path = %backup.display(), %error, "could not remove installation backup");
-    }
-    Ok(())
-}
-
-fn recover_install_artifacts(songs_path: &Path) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(songs_path)?.flatten() {
-        if !entry.path().is_dir() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(without_prefix) = name.strip_prefix('.') else {
-            continue;
-        };
-        let Some((folder_and_nonce, kind)) = without_prefix.rsplit_once('.') else {
-            continue;
-        };
-        if !matches!(kind, "backup" | "installing") {
-            continue;
-        }
-        let Some((folder, nonce)) = folder_and_nonce.rsplit_once('.') else {
-            continue;
-        };
-        if nonce.parse::<u64>().is_err() || folder.is_empty() {
-            continue;
-        }
-        if kind == "installing" {
-            std::fs::remove_dir_all(entry.path())?;
-            continue;
-        }
-        let target = songs_path.join(folder);
-        if target.exists() {
-            std::fs::remove_dir_all(entry.path())?;
-        } else {
-            std::fs::rename(entry.path(), target)?;
-        }
-    }
+    command.spawn().map_err(DownloadError::OsuLaunch)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zip::ZipWriter;
-    use zip::write::SimpleFileOptions;
 
     #[test]
     fn mirror_urls_match_existing_clients() {
@@ -989,70 +908,12 @@ mod tests {
     }
 
     #[test]
-    fn extraction_replaces_existing_folder_only_after_success() {
-        let directory = tempfile::tempdir().unwrap();
-        let songs = directory.path().join("Songs");
-        std::fs::create_dir(&songs).unwrap();
-        let target = songs.join("42 Artist - Title");
-        std::fs::create_dir(&target).unwrap();
-        std::fs::write(target.join("old.txt"), b"old").unwrap();
-        let archive = directory.path().join("map.osz");
-        write_test_archive(&archive, "map.osu", b"osu file format v14");
-        let request = DownloadRequest {
-            beatmap_set_id: 42,
-            title: "Title".to_owned(),
-            artist: "Artist".to_owned(),
-            no_video: true,
-            auto_install: true,
-        };
-
-        extract_archive(&archive, &songs, &request, &CancellationToken::new()).unwrap();
-        assert!(target.join("map.osu").is_file());
-        assert!(!target.join("old.txt").exists());
-    }
-
-    #[test]
-    fn extraction_rejects_parent_traversal() {
-        let directory = tempfile::tempdir().unwrap();
-        let songs = directory.path().join("Songs");
-        std::fs::create_dir(&songs).unwrap();
-        let archive = directory.path().join("map.osz");
-        write_test_archive(&archive, "../outside.txt", b"bad");
-        let request = DownloadRequest {
-            beatmap_set_id: 42,
-            title: "Title".to_owned(),
-            artist: "Artist".to_owned(),
-            no_video: true,
-            auto_install: true,
-        };
-
-        let result = extract_archive(&archive, &songs, &request, &CancellationToken::new());
-        assert!(matches!(result, Err(DownloadError::InvalidArchive)));
-        assert!(!directory.path().join("outside.txt").exists());
-        assert!(!songs.join("42 Artist - Title").exists());
-    }
-
-    #[test]
-    fn recovers_interrupted_install_backup() {
-        let directory = tempfile::tempdir().unwrap();
-        let songs = directory.path().join("Songs");
-        std::fs::create_dir(&songs).unwrap();
-        let backup = songs.join(".42 Artist - Title.123.backup");
-        std::fs::create_dir(&backup).unwrap();
-        std::fs::write(backup.join("map.osu"), b"old").unwrap();
-
-        recover_install_artifacts(&songs).unwrap();
-        assert!(songs.join("42 Artist - Title/map.osu").is_file());
-        assert!(!backup.exists());
-    }
-
-    #[test]
     fn dirty_rate_limit_is_not_replaced_during_role_changes() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("missing").join("rate.dat");
         let mut limiter = RateLimiter::load(false, path);
         let reservation = limiter.reserve().unwrap();
-        assert!(limiter.commit(reservation).is_err());
+        assert!(limiter.commit(reservation));
         assert!(limiter.dirty);
 
         limiter.set_supporter(true);
@@ -1060,13 +921,38 @@ mod tests {
         assert_eq!(limiter.timestamps.len(), 1);
     }
 
-    fn write_test_archive(path: &Path, name: &str, contents: &[u8]) {
-        let file = File::create(path).unwrap();
-        let mut archive = ZipWriter::new(file);
-        archive
-            .start_file(name, SimpleFileOptions::default())
-            .unwrap();
-        archive.write_all(contents).unwrap();
-        archive.finish().unwrap();
+    #[test]
+    fn stale_persist_does_not_clear_newer_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut limiter = RateLimiter::load(false, directory.path().join("rate.dat"));
+        let first = limiter.reserve().unwrap();
+        let second = limiter.reserve().unwrap();
+        assert!(limiter.commit(first));
+        let (_, _, revision) = limiter.persist_payload().unwrap();
+        assert!(limiter.commit(second));
+        limiter.persisted(revision);
+        assert!(limiter.dirty);
+        let (_, timestamps, revision) = limiter.persist_payload().unwrap();
+        assert_eq!(timestamps.len(), 2);
+        limiter.persisted(revision);
+        assert!(!limiter.dirty);
+        assert!(limiter.persist_payload().is_none());
+    }
+
+    #[test]
+    fn no_video_archives_are_named_separately() {
+        let mut request = DownloadRequest {
+            beatmap_set_id: 42,
+            title: "T".to_owned(),
+            artist: "A".to_owned(),
+            no_video: false,
+            auto_install: true,
+        };
+        let with_video = archive_name(&request);
+        request.no_video = true;
+        let without_video = archive_name(&request);
+        assert_ne!(with_video, without_video);
+        assert_eq!(id_from_file_name(&with_video), Some(42));
+        assert_eq!(id_from_file_name(&without_video), Some(42));
     }
 }

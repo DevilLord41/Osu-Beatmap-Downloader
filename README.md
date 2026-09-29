@@ -25,7 +25,7 @@ Grab the latest release from the [Releases page](https://github.com/DevilLord41/
 - Filter by game mode (osu!, taiko, catch, mania) and status (ranked, qualified, loved, pending, graveyard)
 - Advanced search with custom filters: `star>=5 & star<=10`, `bpm>=180`, `ar>=9`, `cs>=4`, `od>=8`, `hp>=5`, `length>=120`
 - One-click download with download queue (max 2 concurrent)
-- Auto-install: extracts .osz and moves to your osu! Songs folder
+- Auto-install: opens the downloaded .osz with osu!.exe so the game imports it (starts osu! if it isn't running)
 - Preview audio playback (supports both MP3 and OGG formats)
 - Smart caching: beatmap results cached in memory and on disk for instant mode switching
 - Qualified maps refresh from the first page so status changes are immediately visible
